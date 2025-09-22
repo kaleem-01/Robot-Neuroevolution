@@ -16,6 +16,7 @@ from ariel.utils.renderers import video_renderer
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
 from ariel.simulation.environments.rugged_heightmap import RuggedTerrainWorld
+from ariel.simulation.environments.simple_tilted_world import TiltedFlatWorld
 
 # import prebuilt robot phenotypes
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
@@ -28,15 +29,15 @@ import multiprocessing
 SEED = 42
 SIM_DURATION = 10.0          # seconds per evaluation
 SMOOTH_ALPHA = 0.2          # 0..1, higher tracks target faster (smoother with lower)
-POP_SIZE = 100
+POP_SIZE = 50
 ELITES = POP_SIZE // 10                   # number of elites to carry over each generation
-GENERATIONS = 50
+GENERATIONS = 20
 MUTATION_SIGMA = 0.25       # base mutation scale
 TOURNAMENT_K = 5            # tournament size for parent selection
 
 # IMPORTANT: make these positive if you want *penalties*
 ENERGY_PENALTY = 0.00       # penalty * mean(|ctrl|)
-SPEED_PENALTY  = 0.00       # penalty * mean(|dctrl|)
+SPEED_PENALTY  = -0.05       # penalty * mean(|dctrl|)
 
 # Frequency bounds (shared across joints)
 FREQ_MIN = 0.5
@@ -56,7 +57,9 @@ def build_world_and_model(terrain=None):
 
     if terrain == "rough":
         world = RuggedTerrainWorld()
-    else:
+    elif terrain == "tilted":
+        world = TiltedFlatWorld()
+    else:   #TODO TiltedFlatWorld
         world = SimpleFlatWorld()
     gecko_core = gecko()
     world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
@@ -243,7 +246,7 @@ def evolve(terrain="flat"):
     overall_best_curve = []
 
     for gen in range(GENERATIONS):
-        # Evaluate
+        # Evaluate        
         with multiprocessing.Pool() as pool:
             fitnesses = pool.starmap(
             rollout_and_score,
@@ -430,7 +433,7 @@ def random_move(model, data, to_track) -> None:
 
 
 if __name__ == "__main__":
-    terrain = "rough"
+    terrain = "tilted"
     print(f"Running EA on {terrain} terrain...")
     print(f"  Population size: {POP_SIZE}")
     print(f"  Generations: {GENERATIONS}")
@@ -440,9 +443,9 @@ if __name__ == "__main__":
     best_fits = []
     best_params_list = []
     # Repeat 3 times to see variance
-    for i in range(3):
+    for i in range(2):
     # Run main EA and watch best on selected terrain
-        best_params, best_fit, gen_best_curve, overall_best_curve = main(terrain=terrain, save=False)
+        best_params, best_fit, gen_best_curve, overall_best_curve = main(terrain=terrain, save=True)
         overall_best_curves.append(overall_best_curve)
         gen_best_curves.append(gen_best_curve)
         best_fits.append(best_fit)
@@ -470,4 +473,5 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(f"fitness_curve_{terrain}.png", dpi=800)
+    # plt.savefig(f"fitness_curve_{terrain}.png", dpi=800)
+    plt.show()
