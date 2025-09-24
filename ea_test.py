@@ -247,11 +247,7 @@ def evolve(terrain="flat"):
 
     for gen in range(GENERATIONS):
         # Evaluate        
-        with multiprocessing.Pool() as pool:
-            fitnesses = pool.starmap(
-            rollout_and_score,
-            [(ind, SIM_DURATION, terrain) for ind in population]
-            )
+        fitnesses = [rollout_and_score(ind, SIM_DURATION, terrain) for ind in population]
 
         # Track best of generation
         gen_best_idx = int(np.argmax([f.fitness for f in fitnesses]))
