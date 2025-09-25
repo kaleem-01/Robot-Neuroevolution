@@ -26,11 +26,11 @@ from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 # Config
 # =========================
 SEED = 42
-SIM_DURATION = 10.0          # seconds per evaluation
+SIM_DURATION = 30.0          # seconds per evaluation
 SMOOTH_ALPHA = 0.2          # 0..1, higher tracks target faster (smoother with lower)
 POP_SIZE = 80
 ELITES = POP_SIZE // 10      # number of elites to carry over each generation (for GA only)
-GENERATIONS = 40
+GENERATIONS = 100
 MUTATION_SIGMA = 0.25       # base mutation scale
 TOURNAMENT_K = 5            # tournament size for parent selection (for GA only)
 
@@ -487,7 +487,7 @@ def plot_pairwise_comparison(results, terrain, alg1, alg2, filename):
 
 
 if __name__ == "__main__":
-    NUM_RUNS = 5
+    NUM_RUNS = 10
     terrain = "tilted"
 
     print(f"Starting comparative analysis on '{terrain}' terrain for {NUM_RUNS} runs.")
