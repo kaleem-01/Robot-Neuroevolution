@@ -43,11 +43,11 @@ SEED = 42
 RNG = np.random.default_rng(SEED)
 
 # Evolution hyperparams
-POP_SIZE       = 10
+POP_SIZE       = 100
 ELITES         = max(1, POP_SIZE // 10)
-GENERATIONS    = 10
+GENERATIONS    = 100
 TOURNAMENT_K   = 10
-MUT_BODY_SIGMA = 0.20     # Gaussian noise on NDE input vectors (clipped to [0,1])
+MUT_BODY_SIGMA = 0.10     # Gaussian noise on NDE input vectors (clipped to [0,1])
 MUT_CTRL_SIGMA = 0.15     # Gaussian noise on controller genes
 
 # Simulation
@@ -81,7 +81,7 @@ OUT_DIR.mkdir(exist_ok=True, parents=True)
 type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 
 
-
+# Pretty much useless (tried different parameters to make simulation stable)
 def harden_model(model: mj.MjModel) -> None:
     # Smaller timestep + more accurate integrator
     model.opt.timestep = min(model.opt.timestep, 0.002)          # e.g. 500 Hz
@@ -132,10 +132,9 @@ def get_core_geom_id(model: mj.MjModel) -> int:
             return gid
     return 0  # fallback
 
-
-def show_xpos_history_over_background(history_xyz: list[np.ndarray]) -> None:
-    """Render top-down background and overlay XY path (optional visualization)."""
-    # Top-down camera
+#TODO: USE TEMPLATE VALUES
+def show_xpos_history(history: list[float]) -> None:
+    # Create a tracking camera
     camera = mj.MjvCamera()
     camera.type = mj.mjtCamera.mjCAMERA_FREE
     camera.lookat = [2.5, 0, 0]
@@ -143,29 +142,61 @@ def show_xpos_history_over_background(history_xyz: list[np.ndarray]) -> None:
     camera.azimuth = 0
     camera.elevation = -90
 
+    # Initialize world to get the background
     mj.set_mjcb_control(None)
     world = OlympicArena()
     model = world.spec.compile()
-    # model = harden_model(model)
     data = mj.MjData(model)
-
     save_path = str(DATA / "background.png")
-    single_frame_renderer(model, data, camera=camera, save_path=save_path, save=True)
+    single_frame_renderer(
+        model,
+        data,
+        camera=camera,
+        save_path=save_path,
+        save=True,
+    )
 
+    # Setup background image
     img = plt.imread(save_path)
     _, ax = plt.subplots()
     ax.imshow(img)
+    w, h, _ = img.shape
 
-    pos = np.array(history_xyz)
-    ax.plot(pos[:, 0], pos[:, 1], "-", label="Path")
-    ax.plot(pos[0, 0], pos[0, 1], "go", label="Start")
-    ax.plot(pos[-1, 0], pos[-1, 1], "ro", label="End")
+    # Convert list of [x,y,z] positions to numpy array
+    pos_data = np.array(history)
 
-    ax.set_xlabel("X"); ax.set_ylabel("Y")
-    ax.legend(); ax.set_title("Robot XY path (world coords)")
-    plt.tight_layout()
+    # Calculate initial position
+    x0, y0 = int(h * 0.483), int(w * 0.815)
+    xc, yc = int(h * 0.483), int(w * 0.9205)
+    ym0, ymc = 0, SPAWN_POS[0]
+
+    # Convert position data to pixel coordinates
+    pixel_to_dist = -((ymc - ym0) / (yc - y0))
+    pos_data_pixel = [[xc, yc]]
+    for i in range(len(pos_data) - 1):
+        xi, yi, _ = pos_data[i]
+        xj, yj, _ = pos_data[i + 1]
+        xd, yd = (xj - xi) / pixel_to_dist, (yj - yi) / pixel_to_dist
+        xn, yn = pos_data_pixel[i]
+        pos_data_pixel.append([xn + int(xd), yn + int(yd)])
+    pos_data_pixel = np.array(pos_data_pixel)
+
+    # Plot x,y trajectory
+    ax.plot(x0, y0, "kx", label="[0, 0, 0]")
+    ax.plot(xc, yc, "go", label="Start")
+    ax.plot(pos_data_pixel[:, 0], pos_data_pixel[:, 1], "b-", label="Path")
+    ax.plot(pos_data_pixel[-1, 0], pos_data_pixel[-1, 1], "ro", label="End")
+
+    # Add labels and title
+    ax.set_xlabel("X Position")
+    ax.set_ylabel("Y Position")
+    ax.legend()
+
+    # Title
+    plt.title("Robot Path in XY Plane")
+
+    # Show results
     plt.show()
-
 
 # =========================
 # Template fitness (negative distance to target)
@@ -393,7 +424,7 @@ def rollout(ind: Individual, duration: float=SIM_DURATION, record_path: Optional
 
     # Optional video
     if record_path is not None:
-        video_recorder = VideoRecorder(output_folder=str(OUT_DIR))
+        video_recorder = VideoRecorder(output_folder=str(OUT_DIR) + "/BestVideo.mp4")
         video_renderer(model, data, duration=min(5.0, duration), video_recorder=video_recorder)
 
     return FitnessResult(fitness=fit, distance=dist, reached=reached, steps=steps), history_xyz
@@ -567,7 +598,7 @@ def main(mode: Literal["evolve", "viewer", "load_best"] = "evolve", save_video: 
 
         # Optional XY path figure
         fit, history = rollout(best_ind, duration=SIM_DURATION, record_path=None)
-        show_xpos_history_over_background(history)
+        show_xpos_history(history)
 
     elif mode == "load_best":
         # Paths saved by save_best(..., tag="coevo_simple")
@@ -616,6 +647,7 @@ def main(mode: Literal["evolve", "viewer", "load_best"] = "evolve", save_video: 
 
     else:  # "viewer" -> random individual quick demo
         ind = sample_individual(RNG)
+        print(ind)
         mj.set_mjcb_control(None)
 
         world = OlympicArena()
@@ -645,8 +677,9 @@ def main(mode: Literal["evolve", "viewer", "load_best"] = "evolve", save_video: 
 
 
 if __name__ == "__main__":
+    
     # Examples:
     # main(mode="evolve", save_video=True)
-    # main(mode="viewer")
+    main(mode="evolve")
     # main(mode="load_best")
-    main(mode="evolve", save_video=True)
+    # main(mode="evolve", save_video=True)
