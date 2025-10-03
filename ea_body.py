@@ -1,8 +1,12 @@
-"""Assignment 3 – Coevolution of Body (NDE) and Controller (CPG) – Clean, Sequential"""
+"""Assignment 3 – Coevolution of Body (NDE) and Controller (CPG) – Clean, Sequential
+Fixed to use template SPAWN_POS and fitness (negative distance to TARGET_POSITION),
+and with robust viewer/load_best paths.
+"""
 
 # --- Standard library
 import os
 import hashlib
+import json
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +18,10 @@ import numpy.typing as npt
 import matplotlib.pyplot as plt
 import mujoco as mj
 from mujoco import viewer
+
+# For fallback JSON->graph
+import networkx as nx
+from networkx.readwrite import json_graph
 
 # --- Local libraries (ARIEL)
 from ariel import console
@@ -27,11 +35,6 @@ from ariel.simulation.environments import OlympicArena
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.video_recorder import VideoRecorder
-import pickle
-# from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import load_graph_from_json
-import json
-import networkx as nx
-from networkx.readwrite import json_graph
 
 # =========================
 # Config & Paths
@@ -40,17 +43,20 @@ SEED = 42
 RNG = np.random.default_rng(SEED)
 
 # Evolution hyperparams
-POP_SIZE       = 50
+POP_SIZE       = 10
 ELITES         = max(1, POP_SIZE // 10)
-GENERATIONS    = 20
-TOURNAMENT_K   = 4
-MUT_BODY_SIGMA = 0.10     # Gaussian noise on NDE input vectors (clipped to [0,1])
+GENERATIONS    = 10
+TOURNAMENT_K   = 10
+MUT_BODY_SIGMA = 0.20     # Gaussian noise on NDE input vectors (clipped to [0,1])
 MUT_CTRL_SIGMA = 0.15     # Gaussian noise on controller genes
 
 # Simulation
-SIM_DURATION   = 10.0     # seconds
-SPAWN_POS      = [-0.8, 0.0, 0.10]
-TARGET_X       = 10.0     # not used for termination, just a reference
+SIM_DURATION   =10.0     # seconds
+
+# >>> From the template <<<
+SPAWN_POS       = [-0.8, 0.0, 0.10]
+NUM_OF_MODULES  = 30
+TARGET_POSITION = [5.0, 0.0, 0.5]
 
 # Controller shaping
 SMOOTH_ALPHA   = 0.2
@@ -59,12 +65,7 @@ CTRL_MAX       =  np.pi/2
 FREQ_MIN       = 0.4
 FREQ_MAX       = 2.5
 
-# Fitness shaping
-ENERGY_PENALTY = 0.00     # * mean |ctrl|
-SPEED_PENALTY  = -0.05    # * mean |Δctrl|
-
 # Body (NDE) genome
-NUM_OF_MODULES = 30
 GENOTYPE_SIZE  = 64       # length of each NDE input vector
 
 # Folders
@@ -79,6 +80,42 @@ OUT_DIR.mkdir(exist_ok=True, parents=True)
 # UI types
 type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 
+
+
+def harden_model(model: mj.MjModel) -> None:
+    # Smaller timestep + more accurate integrator
+    model.opt.timestep = min(model.opt.timestep, 0.002)          # e.g. 500 Hz
+    model.opt.integrator = mj.mjtIntegrator.mjINT_RK4
+
+    # Stronger solver settings (more iterations, smaller tolerance)
+    model.opt.iterations    = max(model.opt.iterations, 50)
+    model.opt.ls_iterations = max(model.opt.ls_iterations, 20)
+    model.opt.tolerance     = min(model.opt.tolerance, 1e-8)
+
+    # Damp the joints and add a bit of armature (inertia) to fight spikes
+    if model.dof_damping is not None and model.dof_damping.size > 0:
+        model.dof_damping[:] = np.maximum(model.dof_damping, 0.5)
+    if model.dof_armature is not None and model.dof_armature.size > 0:
+        model.dof_armature[:] = np.maximum(model.dof_armature, 0.01)
+
+    # Ensure actuators have sensible ctrlrange (avoid unbounded torques)
+    if model.nu > 0:
+        if model.actuator_ctrlrange is not None and model.actuator_ctrlrange.size == 2 * model.nu:
+            lo = model.actuator_ctrlrange[:, 0]
+            hi = model.actuator_ctrlrange[:, 1]
+            # If not set (zeros), give them a range consistent with your clamp
+            needs = (hi - lo) < 1e-9
+            lo[needs] = -np.pi/2
+            hi[needs] =  np.pi/2
+            model.actuator_ctrlrange[:, 0] = lo
+            model.actuator_ctrlrange[:, 1] = hi
+
+    # (Optional) slightly reduce sliding friction to limit contact chatter
+    if model.geom_friction is not None and model.geom_friction.size >= 3:
+        fr = model.geom_friction.reshape(-1, 3)
+        fr[:, 0] = np.clip(fr[:, 0], 0.4, None)  # sliding μ
+
+    return model
 
 # =========================
 # Helpers: geom lookup & plotting
@@ -95,6 +132,7 @@ def get_core_geom_id(model: mj.MjModel) -> int:
             return gid
     return 0  # fallback
 
+
 def show_xpos_history_over_background(history_xyz: list[np.ndarray]) -> None:
     """Render top-down background and overlay XY path (optional visualization)."""
     # Top-down camera
@@ -108,6 +146,7 @@ def show_xpos_history_over_background(history_xyz: list[np.ndarray]) -> None:
     mj.set_mjcb_control(None)
     world = OlympicArena()
     model = world.spec.compile()
+    # model = harden_model(model)
     data = mj.MjData(model)
 
     save_path = str(DATA / "background.png")
@@ -118,17 +157,28 @@ def show_xpos_history_over_background(history_xyz: list[np.ndarray]) -> None:
     ax.imshow(img)
 
     pos = np.array(history_xyz)
-    ax.plot(pos[:, 0], pos[:, 1], "b-", label="Path")
+    ax.plot(pos[:, 0], pos[:, 1], "-", label="Path")
     ax.plot(pos[0, 0], pos[0, 1], "go", label="Start")
     ax.plot(pos[-1, 0], pos[-1, 1], "ro", label="End")
 
     ax.set_xlabel("X"); ax.set_ylabel("Y")
     ax.legend(); ax.set_title("Robot XY path (world coords)")
+    plt.tight_layout()
     plt.show()
 
 
 # =========================
-# Controller genome (compact) -> per-joint params (deterministic)
+# Template fitness (negative distance to target)
+# =========================
+def fitness_function(history_xyz: list[np.ndarray]) -> float:
+    xt, yt, zt = TARGET_POSITION
+    xc, yc, zc = history_xyz[-1]
+    cartesian_distance = np.sqrt((xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2)
+    return -float(cartesian_distance)
+
+
+# =========================
+# Controller genome (compact) -> per-joint params
 # =========================
 @dataclass
 class ControllerGenome:
@@ -270,16 +320,13 @@ def build_robot_from_body(body: BodyGenome):
 @dataclass
 class FitnessResult:
     fitness: float
-    x_progress: float
-    energy: float
-    speed: float
+    distance: float
     reached: bool
     steps: int
 
 def rollout(ind: Individual, duration: float=SIM_DURATION, record_path: Optional[str]=None
             ) -> Tuple[FitnessResult, list[np.ndarray]]:
     """Headless rollout. Returns fitness result and (optional) XYZ history."""
-    # Reset any previous control callback
     mj.set_mjcb_control(None)
 
     # World + robot
@@ -292,8 +339,7 @@ def rollout(ind: Individual, duration: float=SIM_DURATION, record_path: Optional
     data  = mj.MjData(model)
 
     if model.nu == 0:
-        # Non-actuated body → terrible fitness
-        return FitnessResult(-1e6, 0.0, 0.0, 0.0, False, 0), []
+        return FitnessResult(fitness=-1e6, distance=1e6, reached=False, steps=0), []
 
     # Stable hash of body for deterministic per-joint params
     tmp_json = str(OUT_DIR / "_tmp_body.json")
@@ -327,39 +373,30 @@ def rollout(ind: Individual, duration: float=SIM_DURATION, record_path: Optional
     history_xyz: list[np.ndarray] = []
     history_xyz.append(data.geom_xpos[core_gid].copy())
 
-    # Baselines for stats
-    start_x = float(data.geom_xpos[core_gid][0])
-    energy_acc = speed_acc = 0.0
-    count = 0
-    last_ctrl = data.ctrl.copy()
-
     # Step
+    steps = 0
     for _ in range(n_steps):
         mj.mj_step(model, data)
-        # Bail out if state explodes
         if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-            return FitnessResult(-1e6, 0.0, 0.0, 0.0, False, count), history_xyz
-        energy_acc += float(np.mean(np.abs(data.ctrl)))
-        speed_acc  += float(np.mean(np.abs(data.ctrl - last_ctrl)))
-        last_ctrl   = data.ctrl.copy()
-        count      += 1
+            # exploding sim → bad fitness
+            dist_bad = 1e6
+            return FitnessResult(fitness=-dist_bad, distance=dist_bad, reached=False, steps=steps), history_xyz
+        steps += 1
         history_xyz.append(data.geom_xpos[core_gid].copy())
 
-    end_x = float(data.geom_xpos[core_gid][0])
-    x_prog = end_x - start_x
-    mean_energy = energy_acc / max(1, count)
-    mean_speed  = speed_acc  / max(1, count)
-    reached = (end_x >= TARGET_X)
-
-    fitness = x_prog - ENERGY_PENALTY * mean_energy - SPEED_PENALTY * mean_speed
+    # Fitness per template: negative distance to TARGET_POSITION
+    xt, yt, zt = TARGET_POSITION
+    xc, yc, zc = history_xyz[-1]
+    dist = float(np.sqrt((xt-xc)**2 + (yt-yc)**2 + (zt-zc)**2))
+    fit  = -dist
+    reached = dist < 0.25  # heuristically "close enough"
 
     # Optional video
     if record_path is not None:
-        # Re-run a short capture (or the same) if needed
-        video_recorder = VideoRecorder(output_folder=str(OUT_DIR), file_prefix=record_path)
+        video_recorder = VideoRecorder(output_folder=str(OUT_DIR))
         video_renderer(model, data, duration=min(5.0, duration), video_recorder=video_recorder)
 
-    return FitnessResult(fitness, x_prog, mean_energy, mean_speed, reached, count), history_xyz
+    return FitnessResult(fitness=fit, distance=dist, reached=reached, steps=steps), history_xyz
 
 
 # =========================
@@ -409,9 +446,8 @@ def evolve() -> Tuple[Individual, FitnessResult, List[float], List[float]]:
             )
             best_fit = gen_best_fit
 
-        print(f"[Gen {gen+1:02d}] best={gen_best_fit.fitness:.3f} "
-              f"| x+={gen_best_fit.x_progress:.3f} | E={gen_best_fit.energy:.3f} | dC={gen_best_fit.speed:.3f} "
-              f"| reached={gen_best_fit.reached}")
+        print(f"[Gen {gen+1:02d}] best_f={gen_best_fit.fitness:.3f} "
+              f"| dist={gen_best_fit.distance:.3f} | reached={gen_best_fit.reached} | steps={gen_best_fit.steps}")
 
         gen_best_curve.append(gen_best_fit.fitness)
         overall_best_curve.append(best_fit.fitness if best_fit else gen_best_fit.fitness)
@@ -432,14 +468,14 @@ def evolve() -> Tuple[Individual, FitnessResult, List[float], List[float]]:
 
     assert best_ind is not None and best_fit is not None
     print("\n=== Evolution complete ===")
-    print(f"Best fitness: {best_fit.fitness:.3f} | x+={best_fit.x_progress:.3f} | reached={best_fit.reached}")
+    print(f"Best fitness: {best_fit.fitness:.3f} | dist={best_fit.distance:.3f} | reached={best_fit.reached}")
     return best_ind, best_fit, gen_best_curve, overall_best_curve
 
 
 # =========================
 # Save / Viz
 # =========================
-def save_best(best: Individual, best_fit: FitnessResult, gen_curve: List[float], overall_curve: List[float], tag: str="run"):
+def save_best(best: Individual, best_fit: FitnessResult, gen_curve: List[float], overall_curve: List[float], tag: str="coevo_simple"):
     core, graph = build_robot_from_body(best.body)
     json_path = OUT_DIR / f"best_body_{tag}.json"
     save_graph_as_json(graph, str(json_path))
@@ -456,11 +492,11 @@ def save_best(best: Individual, best_fit: FitnessResult, gen_curve: List[float],
     console.log(f"Saved best body JSON → {json_path}")
     console.log(f"Saved controller + curves in {OUT_DIR}")
 
-def plot_curves(gen_best_curve: List[float], overall_best_curve: List[float], title="Coevolution Fitness"):
+def plot_curves(gen_best_curve: List[float], overall_best_curve: List[float], title="Coevolution Fitness (−distance to target)"):
     plt.figure(figsize=(8,5))
     plt.plot(gen_best_curve, label="Gen best")
     plt.plot(overall_best_curve, "--", label="Overall best")
-    plt.xlabel("Generation"); plt.ylabel("Fitness")
+    plt.xlabel("Generation"); plt.ylabel("Fitness (higher is better)")
     plt.grid(True); plt.legend()
     plt.title(title)
     plt.tight_layout()
@@ -469,12 +505,30 @@ def plot_curves(gen_best_curve: List[float], overall_best_curve: List[float], ti
 
 
 # =========================
+# Loading helpers
+# =========================
+def load_graph_from_json_robust(json_path: Path) -> "nx.DiGraph":
+    """First try decoder's loader (if available), else fall back to networkx node-link."""
+    with open(json_path, "r", encoding="utf-8") as f:
+        body_json = json.load(f)
+    try:
+        # If your HighProbabilityDecoder exposes a json_to_graph, use it:
+        hpd = HighProbabilityDecoder(NUM_OF_MODULES)
+        graph = hpd.json_to_graph(body_json)
+        return graph
+    except Exception:
+        # Fallback: assume node-link format
+        return json_graph.node_link_graph(body_json)
+
+
+# =========================
 # Main
 # =========================
-def main(mode: Literal["evolve", "viewer"] = "evolve", save_video: bool = False) -> None:
+def main(mode: Literal["evolve", "viewer", "load_best"] = "evolve", save_video: bool = False) -> None:
     if mode == "evolve":
         best_ind, best_fit, gen_best_curve, overall_best_curve = evolve()
-        ##################################
+
+        # Launch viewer on the best individual
         mj.set_mjcb_control(None)
         core, graph = build_robot_from_body(best_ind.body)
         world = OlympicArena()
@@ -482,8 +536,11 @@ def main(mode: Literal["evolve", "viewer"] = "evolve", save_video: bool = False)
         model = world.spec.compile()
         data = mj.MjData(model)
 
-        body_hash = body_fingerprint(str(OUT_DIR / "best_body_coevo_simple.json"))
-        amps, phases, freq = expand_per_joint_params(model, best_ind.ctrl, body_hash)
+        # Stable expansion based on this body
+        tmp_json = str(OUT_DIR / "_tmp_best_view.json")
+        save_graph_as_json(graph, tmp_json)
+        b_hash = body_fingerprint(tmp_json)
+        amps, phases, freq = expand_per_joint_params(model, best_ind.ctrl, b_hash)
 
         prev_ctrl = {"val": None}
         def ctrl_fn(m, d):
@@ -499,80 +556,65 @@ def main(mode: Literal["evolve", "viewer"] = "evolve", save_video: bool = False)
         mj.set_mjcb_control(ctrl_fn)
         viewer.launch(model=model, data=data)
 
-    ##################################################
+        # Persist and visualize
         save_best(best_ind, best_fit, gen_best_curve, overall_best_curve, tag="coevo_simple")
-        plot_curves(gen_best_curve, overall_best_curve, title="Coevolution fitness (sequential)")
+        plot_curves(gen_best_curve, overall_best_curve, title="Coevolution fitness (−distance to target)")
 
-        # Show trajectory of the best (optional)
-        fit, history = rollout(best_ind, duration=SIM_DURATION, record_path=None)
-        show_xpos_history_over_background(history)
-
+        # Optional: a short video of the best
         if save_video:
-            # quick video of best individual
             _ = rollout(best_ind, duration=min(5.0, SIM_DURATION), record_path="best_coevo_simple")
             console.log("Saved video to outputs/.")
 
+        # Optional XY path figure
+        fit, history = rollout(best_ind, duration=SIM_DURATION, record_path=None)
+        show_xpos_history_over_background(history)
 
+    elif mode == "load_best":
+        # Paths saved by save_best(..., tag="coevo_simple")
+        json_path = OUT_DIR / "best_body_coevo_simple.json"
+        ctrl_path = OUT_DIR / "best_ctrl_coevo_simple.pkl"
 
-    # elif mode == "load_best":
-    #     import json
-    #     # from mujoco import mjcf
+        if not json_path.exists():
+            raise FileNotFoundError(f"Body JSON not found: {json_path}")
+        if not ctrl_path.exists():
+            raise FileNotFoundError(f"Controller PKL not found: {ctrl_path}")
 
-    #     # Paths saved by save_best(..., tag="coevo_simple")
-    #     json_path = OUT_DIR / "best_body_coevo_simple.json"
-    #     ctrl_path = OUT_DIR / "best_ctrl_coevo_simple.pkl"
+        # --- Load the saved body graph JSON robustly
+        graph = load_graph_from_json_robust(json_path)
+        core = construct_mjspec_from_graph(graph)
 
-    #     if not json_path.exists():
-    #         raise FileNotFoundError(f"Body JSON not found: {json_path}")
-    #     if not ctrl_path.exists():
-    #         raise FileNotFoundError(f"Controller PKL not found: {ctrl_path}")
+        # --- Load controller genome
+        with open(ctrl_path, "rb") as f:
+            ctrl = pickle.load(f)
+        if isinstance(ctrl, dict):
+            ctrl = ControllerGenome(**ctrl)
 
-    #     # --- Load the saved body graph JSON (using mujoco’s json loader)
-    #     with open(json_path, "r", encoding="utf-8") as f:
-    #         body_json = json.load(f)
+        # --- Launch viewer
+        mj.set_mjcb_control(None)
+        world = OlympicArena()
+        world.spawn(core.spec, spawn_position=SPAWN_POS)
+        model = world.spec.compile()
+        data  = mj.MjData(model)
 
-    #     # Now body_json is exactly what save_graph_as_json wrote.
-    #     # Convert back to a graph the same way as in build_robot_from_body:
-    #     from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
-    #         HighProbabilityDecoder,
-    #     )
-    #     hpd = HighProbabilityDecoder(NUM_OF_MODULES)
-    #     graph = hpd.json_to_graph(body_json)   # <--- use the decoder’s loader
-    #     core = construct_mjspec_from_graph(graph)
+        # Expand controller params for this body
+        b_hash = body_fingerprint(str(json_path))
+        amps, phases, freq = expand_per_joint_params(model, ctrl, b_hash)
 
-    #     # --- Load controller genome
-    #     with open(ctrl_path, "rb") as f:
-    #         ctrl = pickle.load(f)
-    #     if isinstance(ctrl, dict):
-    #         ctrl = ControllerGenome(**ctrl)
+        prev_ctrl = {"val": None}
+        def ctrl_fn(m, d):
+            t = d.time
+            target = amps * (np.pi/2) * np.sin(2*np.pi*freq * t + phases)
+            if prev_ctrl["val"] is None:
+                new_ctrl = SMOOTH_ALPHA * target
+            else:
+                new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
+            d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
+            prev_ctrl["val"] = d.ctrl.copy()
 
-    #     # --- Launch viewer
-    #     mj.set_mjcb_control(None)
-    #     world = OlympicArena()
-    #     world.spawn(core.spec, spawn_position=SPAWN_POS)
-    #     model = world.spec.compile()
-    #     data  = mj.MjData(model)
+        mj.set_mjcb_control(ctrl_fn)
+        viewer.launch(model=model, data=data)
 
-    #     # Expand controller params
-    #     b_hash = body_fingerprint(str(json_path))
-    #     amps, phases, freq = expand_per_joint_params(model, ctrl, b_hash)
-
-    #     prev_ctrl = {"val": None}
-    #     def ctrl_fn(m, d):
-    #         t = d.time
-    #         target = amps * (np.pi/2) * np.sin(2*np.pi*freq * t + phases)
-    #         if prev_ctrl["val"] is None:
-    #             new_ctrl = SMOOTH_ALPHA * target
-    #         else:
-    #             new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
-    #         d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
-    #         prev_ctrl["val"] = d.ctrl.copy()
-
-    #     mj.set_mjcb_control(ctrl_fn)
-    #     viewer.launch(model=model, data=data)
-
-    else:
-        # Simple viewer demo: sample a random body + controller and launch
+    else:  # "viewer" -> random individual quick demo
         ind = sample_individual(RNG)
         mj.set_mjcb_control(None)
 
@@ -603,6 +645,8 @@ def main(mode: Literal["evolve", "viewer"] = "evolve", save_video: bool = False)
 
 
 if __name__ == "__main__":
-    # mode="viewer" to just watch a random individual
+    # Examples:
     # main(mode="evolve", save_video=True)
+    # main(mode="viewer")
+    # main(mode="load_best")
     main(mode="evolve", save_video=True)
