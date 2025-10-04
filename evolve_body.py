@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, Tuple, List, Optional
 from dataclasses import dataclass
 import contextlib
 import time
+import multiprocessing as mp
 
 # === Third-party
 import numpy as np
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
 # ---------- Config toggles ----------
-USE_CPG: bool = True            # switch to CPG for speedier learning
+USE_CPG: bool = False            # switch to CPG for speedier learning
 RUN_ONE_GENERATION: bool = True # run a single generation per execution (resume later)
 SAVE_GRAPH_AND_BEST: bool = True
 MAX_PROCESSES: int = 15          # cap multiprocessing
@@ -67,9 +68,9 @@ SPAWN_POS_LIST = [SPAWN_START, SPAWN_MID, SPAWN_LATE]
 TARGET_POSITION = [5.0, 0.0, 0.5]
 
 # ---------- Evolution hyperparams ----------
-POP_SIZE       = 60
+POP_SIZE       = 10
 ELITES         = max(1, POP_SIZE // 10)
-GENERATIONS    = 50                # total desired (if not chunked)
+GENERATIONS    = 5                # total desired (if not chunked)
 TOURNAMENT_K   = 8
 MUT_BODY_SIGMA = 0.40
 GENOTYPE_SIZE  = 64
@@ -153,9 +154,7 @@ def nn_controller(model: mj.MjModel, data: mj.MjData, body: Optional[BodyGenome]
         return np.zeros(0, dtype=np.float64)
 
     seed = 12345
-    if body is not None:
-        seed = int(1e6 * float(np.mean(body.type_p) + np.mean(body.conn_p) + np.mean(body.rot_p))) & 0x7FFFFFFF
-    rng = np.random.default_rng(seed ^ input_size ^ (hidden_size << 8) ^ (output_size << 16))
+    rng = np.random.default_rng(seed)
 
     if body is not None:
         w1 = _prepare_matrix_from_genome(body.type_p, (input_size,  hidden_size), rng)
@@ -238,11 +237,17 @@ def cpg_controller_factory(model: mj.MjModel) -> callable:
 # =========================
 # Simulation helpers
 # =========================
-def fitness_function(history: List[List[float]]) -> float:
-    # history: list of [x,y,z]
+
+def fitness_function(history: list[float]) -> float:
     xt, yt, zt = TARGET_POSITION
     xc, yc, zc = history[-1]
-    return -float(np.sqrt((xt-xc)**2 + (yt-yc)**2 + (zt-zc)**2))
+
+    # Minimize the distance --> maximize the negative distance
+    cartesian_distance = np.sqrt(
+        (xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2,
+    )
+    return -cartesian_distance
+
 
 def last_x(history: List[List[float]]) -> float:
     return float(history[-1][0])
@@ -286,7 +291,7 @@ def experiment(
         viewer.launch(model=model, data=data)
 
     sim_time = time.time() - t0
-    return controller.tracker.history["xpos"][0], sim_time
+    return controller.tracker.history["xpos"][-1], sim_time
 
 # ---------- Non-learner filter ----------
 def quick_motion_screen(body: BodyGenome, spawn: List[float]) -> bool:
@@ -337,9 +342,9 @@ def choose_spawn(gen: int, rng: np.random.Generator) -> List[float]:
     if gen < 5:
         return SPAWN_START
     elif gen < 15:
-        return SPAWN_POS_LIST[rng.integers(0, 2)]  # start or mid
+        return SPAWN_POS_LIST[1]  # start or mid
     else:
-        return SPAWN_POS_LIST[rng.integers(0, 3)]  # any of 3
+        return SPAWN_POS_LIST[2]  # any of 3
 
 # ---------- Rollout & score (with curriculum & dynamic duration) ----------
 def rollout_and_score(body: BodyGenome, duration: float, spawn: List[float]) -> Tuple[float,float]:
@@ -416,21 +421,34 @@ def load_state() -> Tuple[int, List[BodyGenome], BodyGenome, List[float], List[f
     return int(s["gen"]), pop, best, gen_curve, overall_curve, best_progress_x
 
 # ---------- Evaluation (multiprocessing) ----------
+# def _worker_eval(args):
+#     ind, duration, spawn = args
+#     # try:
+#     fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
+#     return (fit, px)
+#     # except Exception:
+#         # return (-1e9, -1e9)
+
+
+# def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float,float]]:
+#     # choose spawn per evaluation to encourage generalisation
+#     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
+#     # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
+    
+#     with mp.Pool() as pool:
+#         results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
+#     return results
+
 def _worker_eval(args):
     ind, duration, spawn = args
-    try:
-        fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
-        return (fit, px)
-    except Exception:
-        return (-1e9, -1e9)
+    fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
+    return (fit, px)
 
-def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float,float]]:
-    # choose spawn per evaluation to encourage generalisation
+def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float, float]]:
     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
-    # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
-    from multiprocessing import Pool
-    with Pool(processes=min(MAX_PROCESSES, len(pop))) as pool:
-        results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
+    results = []
+    for i, ind in enumerate(pop):
+        results.append(_worker_eval((ind, duration, spawn_choices[i])))
     return results
 
 # ---------- Initial population with non-learner filter ----------
@@ -474,6 +492,10 @@ def evolve(total_generations: int = GENERATIONS, run_one_generation: bool = RUN_
 
         # Evaluate
         results = evaluate_population(population, duration=duration, gen=gen)
+        # print(results)
+        # with open(DATA / "output.txt", "a") as f:
+        #     for i, (fit, px) in enumerate(results):
+        #         f.write(f"Gen {gen+1}, Ind {i}, Fitness: {fit:.4f}, Progress_x: {px:.4f}\n")
         for ind, (fit, px) in zip(population, results):
             ind.fitness = fit
             ind.progress_x = px

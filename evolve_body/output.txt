@@ -1,0 +1,10 @@
+Gen 1, Ind 0, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 1, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 2, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 3, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 4, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 5, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 6, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 7, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 8, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
+Gen 1, Ind 9, Fitness: -1000000000.0000, Progress_x: -1000000000.0000
