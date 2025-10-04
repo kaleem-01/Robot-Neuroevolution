@@ -1,23 +1,28 @@
-# --- Standard library
+"""Assignment 3 template code — with non-learner filter, dynamic duration,
+multi-spawn training, per-generation save/resume, CPG option, and warning capture.
+"""
+
+# === Standard library
+from __future__ import annotations
 import os
-import hashlib
+import sys
+import io
 import json
 import pickle
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Tuple, List
+from typing import TYPE_CHECKING, Any, Literal, Tuple, List, Optional
+from dataclasses import dataclass
+import contextlib
+import time
 
-# --- Third-party
+# === Third-party
 import numpy as np
+import numpy.typing as npt
 import matplotlib.pyplot as plt
 import mujoco as mj
 from mujoco import viewer
 
-# For fallback JSON->graph
-import networkx as nx
-from networkx.readwrite import json_graph
-
-# --- Local libraries (ARIEL)
+# === Local libraries
 from ariel import console
 from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
 from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
@@ -25,180 +30,54 @@ from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     save_graph_as_json,
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
+from ariel.simulation.controllers.controller import Controller
 from ariel.simulation.environments import OlympicArena
 from ariel.utils.renderers import single_frame_renderer, video_renderer
+from ariel.utils.runners import simple_runner
+from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
 
-# =========================
-# Config & Paths
-# =========================
+if TYPE_CHECKING:
+    from networkx import DiGraph
+
+# ---------- Config toggles ----------
+USE_CPG: bool = True            # switch to CPG for speedier learning
+RUN_ONE_GENERATION: bool = True # run a single generation per execution (resume later)
+SAVE_GRAPH_AND_BEST: bool = True
+MAX_PROCESSES: int = 15          # cap multiprocessing
+
+# ---------- Randomness, paths ----------
 SEED = 42
 RNG = np.random.default_rng(SEED)
 
-# Evolution hyperparams (outer/body EA)
-POP_SIZE       = 10
-ELITES         = max(1, POP_SIZE // 10)
-GENERATIONS    = 3
-TOURNAMENT_K   = 10
-
-# Mutation scales
-MUT_BODY_SIGMA = 0.10     # Gaussian noise on NDE input vectors (clipped to [0,1])
-MUT_CTRL_SIGMA = 0.15     # Gaussian noise on controller genes
-
-# Simulation
-SIM_DURATION   = 10.0     # seconds
-
-# Template values
-SPAWN_POS       = [-0.8, 0.0, 0.10]
-NUM_OF_MODULES  = 30
-TARGET_POSITION = [5.0, 0.0, 0.5]
-
-# Controller shaping
-SMOOTH_ALPHA   = 0.2
-CTRL_MIN       = -np.pi/2
-CTRL_MAX       =  np.pi/2
-FREQ_MIN       = 0.4
-FREQ_MAX       = 2.5
-
-# Body (NDE) genome
-GENOTYPE_SIZE  = 64       # length of each NDE input vector
-
-# Inner-controller budget (per body)
-CTRL_INNER_POP   = 12
-CTRL_INNER_GENS  = 6
-CTRL_INNER_K     = 6
-CTRL_INNER_ELITE = max(1, CTRL_INNER_POP // 8)
-
-# Final controller refinement budget for the best body
-CTRL_FINAL_POP   = 24
-CTRL_FINAL_GENS  = 20
-CTRL_FINAL_K     = 8
-CTRL_FINAL_ELITE = max(1, CTRL_FINAL_POP // 8)
-
-# Folders
-SCRIPT_NAME = Path(__file__).stem
+SCRIPT_NAME = __file__.split("/")[-1][:-3]
 CWD = Path.cwd()
 DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(parents=True, exist_ok=True)
 
-OUT_DIR = DATA / "outputs"
-OUT_DIR.mkdir(exist_ok=True, parents=True)
+WARN_LOG = DATA / "mujoco_warnings.txt"
 
-# =========================
-# Stabilization helpers (optional tuning)
-# =========================
-def harden_model(model: mj.MjModel) -> mj.MjModel:
-    model.opt.timestep   = min(getattr(model.opt, "timestep", 0.005), 0.002)
-    model.opt.integrator = mj.mjtIntegrator.mjINT_RK4
-    model.opt.iterations    = max(getattr(model.opt, "iterations", 50), 50)
-    model.opt.ls_iterations = max(getattr(model.opt, "ls_iterations", 20), 20)
-    model.opt.tolerance     = min(getattr(model.opt, "tolerance", 1e-6), 1e-8)
+# ---------- World / task ----------
+NUM_OF_MODULES = 30
+SPAWN_START  = [-0.8, 0.0, 0.1]
+SPAWN_MID    = [ 2.0, 0.0, 0.1]   # around rugged start
+SPAWN_LATE   = [ 4.0, 0.0, 0.1]   # near the end section
+SPAWN_POS_LIST = [SPAWN_START, SPAWN_MID, SPAWN_LATE]
 
-    if model.dof_damping is not None and model.dof_damping.size > 0:
-        model.dof_damping[:] = np.maximum(model.dof_damping, 0.5)
-    if model.dof_armature is not None and model.dof_armature.size > 0:
-        model.dof_armature[:] = np.maximum(model.dof_armature, 0.01)
+TARGET_POSITION = [5.0, 0.0, 0.5]
 
-    if model.nu > 0:
-        if model.actuator_ctrlrange is not None and model.actuator_ctrlrange.size == 2 * model.nu:
-            lo = model.actuator_ctrlrange[:, 0]
-            hi = model.actuator_ctrlrange[:, 1]
-            needs = (hi - lo) < 1e-9
-            lo[needs] = CTRL_MIN
-            hi[needs] = CTRL_MAX
-            model.actuator_ctrlrange[:, 0] = lo
-            model.actuator_ctrlrange[:, 1] = hi
+# ---------- Evolution hyperparams ----------
+POP_SIZE       = 60
+ELITES         = max(1, POP_SIZE // 10)
+GENERATIONS    = 50                # total desired (if not chunked)
+TOURNAMENT_K   = 8
+MUT_BODY_SIGMA = 0.40
+GENOTYPE_SIZE  = 64
 
-    if model.geom_friction is not None and model.geom_friction.size >= 3:
-        fr = model.geom_friction.reshape(-1, 3)
-        fr[:, 0] = np.clip(fr[:, 0], 0.4, None)
-    return model
+# Base duration; dynamic schedule will override
+BASE_SIM_DURATION = 15
 
-def get_core_geom_id(model: mj.MjModel) -> int:
-    try:
-        return mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "core")
-    except Exception:
-        pass
-    for gid in range(model.ngeom):
-        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, gid)
-        if name and "core" in name:
-            return gid
-    return 0
-
-# =========================
-# Fitness
-# =========================
-def fitness_function(history_xyz: List[np.ndarray]) -> float:
-    xt, yt, zt = TARGET_POSITION
-    xc, yc, zc = history_xyz[-1]
-    cartesian_distance = np.sqrt((xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2)
-    return -float(cartesian_distance)
-
-# =========================
-# Controller genome (compact) -> per-joint params
-# =========================
-@dataclass
-class ControllerGenome:
-    frequency: float         # [FREQ_MIN, FREQ_MAX]
-    amp_mean: float          # [0, 1]
-    amp_std: float           # [0, 1]
-    phase_mean: float        # [-pi, pi]
-    phase_std: float         # [0, pi]
-    seed: int                # base seed to expand per-joint params
-
-def clip_ctrl_genome(g: ControllerGenome) -> ControllerGenome:
-    g.frequency  = float(np.clip(g.frequency, FREQ_MIN, FREQ_MAX))
-    g.amp_mean   = float(np.clip(g.amp_mean, 0.0, 1.0))
-    g.amp_std    = float(np.clip(g.amp_std,  0.0, 1.0))
-    g.phase_mean = float(((g.phase_mean + np.pi) % (2*np.pi)) - np.pi)
-    g.phase_std  = float(np.clip(g.phase_std, 0.0, np.pi))
-    return g
-
-def sample_ctrl_genome(rng: np.random.Generator) -> ControllerGenome:
-    return ControllerGenome(
-        frequency  = float(rng.uniform(FREQ_MIN, FREQ_MAX)),
-        amp_mean   = float(rng.uniform(0.2, 0.8)),
-        amp_std    = float(rng.uniform(0.05, 0.35)),
-        phase_mean = float(rng.uniform(-np.pi, np.pi)),
-        phase_std  = float(rng.uniform(0.1, 0.8*np.pi)),
-        seed       = int(rng.integers(0, np.iinfo(np.int32).max))
-    )
-
-def mutate_ctrl_genome(rng: np.random.Generator, g: ControllerGenome, sigma: float=MUT_CTRL_SIGMA) -> ControllerGenome:
-    g2 = ControllerGenome(
-        frequency  = g.frequency  + rng.normal(0.0, sigma),
-        amp_mean   = g.amp_mean   + rng.normal(0.0, sigma),
-        amp_std    = g.amp_std    + rng.normal(0.0, sigma),
-        phase_mean = g.phase_mean + rng.normal(0.0, sigma*np.pi),
-        phase_std  = g.phase_std  + rng.normal(0.0, sigma),
-        seed       = g.seed if rng.random() > 0.1 else int(rng.integers(0, np.iinfo(np.int32).max))
-    )
-    return clip_ctrl_genome(g2)
-
-def blend_ctrl_genome(rng: np.random.Generator, a: ControllerGenome, b: ControllerGenome) -> ControllerGenome:
-    def blend(x, y, scale=0.5): return (1.0 - scale) * x + scale * y
-    g = ControllerGenome(
-        frequency  = blend(a.frequency,  b.frequency),
-        amp_mean   = blend(a.amp_mean,   b.amp_mean),
-        amp_std    = blend(a.amp_std,    b.amp_std),
-        phase_mean = blend(a.phase_mean, b.phase_mean),
-        phase_std  = blend(a.phase_std,  b.phase_std),
-        seed       = a.seed if rng.random() < 0.5 else b.seed
-    )
-    return clip_ctrl_genome(g)
-
-def expand_per_joint_params(model: mj.MjModel, ctrl_g: ControllerGenome, body_hash: int
-                            ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Map compact controller genome to joint-wise amplitudes/phases for this body (any model.nu)."""
-    nu = model.nu
-    seed_mix = (ctrl_g.seed ^ body_hash) & 0x7FFFFFFF
-    rng = np.random.default_rng(seed_mix)
-    amps   = rng.normal(loc=ctrl_g.amp_mean,   scale=abs(ctrl_g.amp_std),  size=nu)
-    phases = rng.normal(loc=ctrl_g.phase_mean, scale=abs(ctrl_g.phase_std), size=nu)
-    amps   = np.clip(amps, 0.0, 1.0)
-    phases = ((phases + np.pi) % (2*np.pi)) - np.pi
-    freq   = float(np.clip(ctrl_g.frequency, FREQ_MIN, FREQ_MAX))
-    return amps, phases, freq
+ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 
 # =========================
 # Body genome (NDE inputs)
@@ -208,6 +87,8 @@ class BodyGenome:
     type_p: np.ndarray   # float32 in [0,1], shape (GENOTYPE_SIZE,)
     conn_p: np.ndarray   # float32 in [0,1]
     rot_p:  np.ndarray   # float32 in [0,1]
+    fitness: float = -np.inf
+    progress_x: float = 0.0
 
 def sample_body_genome(rng: np.random.Generator) -> BodyGenome:
     return BodyGenome(
@@ -222,15 +103,24 @@ def mutate_body_genome(rng: np.random.Generator, g: BodyGenome, sigma: float=MUT
         return np.clip(y, 0.0, 1.0).astype(np.float32)
     return BodyGenome(mut(g.type_p), mut(g.conn_p), mut(g.rot_p))
 
-def blend_body_genome(rng: np.random.Generator, a: BodyGenome, b: BodyGenome) -> BodyGenome:
-    alpha = 0.5
-    def blend(x, y): return np.clip((1-alpha)*x + alpha*y, 0.0, 1.0).astype(np.float32)
-    return BodyGenome(blend(a.type_p, b.type_p),
-                      blend(a.conn_p, b.conn_p),
-                      blend(a.rot_p,  b.rot_p))
+def _sbx_pair(rng, x, y, eta: float = 15.0):
+    u = rng.random(x.shape)
+    beta = np.where(u <= 0.5, (2*u)**(1/(eta+1)), (1/(2*(1-u)))**(1/(eta+1)))
+    c1 = 0.5*((1+beta)*x + (1-beta)*y)
+    c2 = 0.5*((1-beta)*x + (1+beta)*y)
+    choose = rng.random(x.shape) < 0.5
+    child = np.where(choose, c1, c2)
+    return np.clip(child, 0.0, 1.0)
+
+def crossover_sbx_linked(rng: np.random.Generator, a: BodyGenome, b: BodyGenome, eta: float = 15.0) -> BodyGenome:
+    return BodyGenome(
+        type_p = _sbx_pair(rng, a.type_p, b.type_p, eta).astype(np.float32),
+        conn_p = _sbx_pair(rng, a.conn_p, b.conn_p, eta).astype(np.float32),
+        rot_p  = _sbx_pair(rng, a.rot_p,  b.rot_p,  eta).astype(np.float32),
+    )
 
 # =========================
-# Build body → MuJoCo model
+# Build, control, fitness
 # =========================
 def build_robot_from_body(body: BodyGenome):
     nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
@@ -240,474 +130,535 @@ def build_robot_from_body(body: BodyGenome):
     core = construct_mjspec_from_graph(graph)
     return core, graph
 
-def body_fingerprint(graph_json_path: str) -> int:
-    with open(graph_json_path, "rb") as f:
-        h = hashlib.blake2b(f.read(), digest_size=8).digest()
-    return int.from_bytes(h, byteorder="little", signed=False)
-
-# =========================
-# Rollouts
-# =========================
-@dataclass
-class FitnessResult:
-    fitness: float
-    distance: float
-    reached: bool
-    steps: int
-
-def rollout(ind_body: BodyGenome, ind_ctrl: ControllerGenome,
-            duration: float=SIM_DURATION, record_path: Optional[str]=None
-            ) -> Tuple[FitnessResult, List[np.ndarray]]:
-    """Headless rollout for a fixed body+controller. Returns fitness and XYZ history."""
-    mj.set_mjcb_control(None)
-
-    # World + robot
-    world = OlympicArena()
-    core, graph = build_robot_from_body(ind_body)
-    world.spawn(core.spec, spawn_position=SPAWN_POS)
-
-    model = world.spec.compile()
-    harden_model(model)
-    data  = mj.MjData(model)
-
-    if model.nu == 0:
-        return FitnessResult(fitness=-1e6, distance=1e6, reached=False, steps=0), []
-
-    # Stable hash of body for deterministic per-joint params
-    tmp_json = str(OUT_DIR / "_tmp_body.json")
-    save_graph_as_json(graph, tmp_json)
-    b_hash = body_fingerprint(tmp_json)
-
-    # Expand controller to per-joint parameters
-    amps, phases, freq = expand_per_joint_params(model, ind_ctrl, b_hash)
-
-    # Control callback (smooth tracking of sine targets)
-    prev_ctrl = {"val": None}
-    def ctrl_fn(m: mj.MjModel, d: mj.MjData):
-        t = d.time
-        target = amps * (np.pi/2) * np.sin(2*np.pi*freq* t + phases)
-        if prev_ctrl["val"] is None:
-            new_ctrl = SMOOTH_ALPHA * target
-        else:
-            new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
-        d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
-        prev_ctrl["val"] = d.ctrl.copy()
-
-    mj.set_mjcb_control(ctrl_fn)
-
-    core_gid = get_core_geom_id(model)
-    mj.mj_resetData(model, data)
-    dt      = model.opt.timestep
-    n_steps = int(np.ceil(duration / dt))
-
-    history_xyz: List[np.ndarray] = []
-    history_xyz.append(data.geom_xpos[core_gid].copy())
-
-    steps = 0
-    for _ in range(n_steps):
-        mj.mj_step(model, data)
-        if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-            dist_bad = 1e6
-            return FitnessResult(fitness=-dist_bad, distance=dist_bad, reached=False, steps=steps), history_xyz
-        steps += 1
-        history_xyz.append(data.geom_xpos[core_gid].copy())
-
-    # Fitness per template: negative distance to TARGET_POSITION
-    xt, yt, zt = TARGET_POSITION
-    xc, yc, zc = history_xyz[-1]
-    dist = float(np.sqrt((xt-xc)**2 + (yt-yc)**2 + (zt-zc)**2))
-    fit  = -dist
-    reached = dist < 0.25
-
-    # Optional video
-    if record_path is not None:
-        video_recorder = VideoRecorder(output_folder=str(OUT_DIR) + "/BestVideo.mp4")
-        video_renderer(model, data, duration=min(5.0, duration), video_recorder=video_recorder)
-
-    return FitnessResult(fitness=fit, distance=dist, reached=reached, steps=steps), history_xyz
-
-# =========================
-# Hierarchical EA
-# =========================
-def _build_model_for_body(body: BodyGenome) -> Tuple[mj.MjModel, mj.MjData, int, "nx.DiGraph", int]:
-    """Compile a model once for a given body (faster for inner controller EA)."""
-    world = OlympicArena()
-    core, graph = build_robot_from_body(body)
-    world.spawn(core.spec, spawn_position=SPAWN_POS)
-    model = world.spec.compile()
-    harden_model(model)
-    data  = mj.MjData(model)
-
-    tmp_json = str(OUT_DIR / "_tmp_body_for_model.json")
-    save_graph_as_json(graph, tmp_json)
-    b_hash = body_fingerprint(tmp_json)
-
-    core_gid = get_core_geom_id(model)
-    return model, data, core_gid, graph, b_hash
-
-def _rollout_fixed_model(model: mj.MjModel, data: mj.MjData, core_gid: int,
-                         ctrl: ControllerGenome, body_hash: int,
-                         duration: float = SIM_DURATION) -> Tuple[FitnessResult, List[np.ndarray]]:
-    """Faster rollout if reusing a compiled model for a given body."""
-    mj.set_mjcb_control(None)
-    if model.nu == 0:
-        return FitnessResult(fitness=-1e6, distance=1e6, reached=False, steps=0), []
-
-    amps, phases, freq = expand_per_joint_params(model, ctrl, body_hash)
-    prev_ctrl = {"val": None}
-    def ctrl_fn(m: mj.MjModel, d: mj.MjData):
-        t = d.time
-        target = amps * (np.pi/2) * np.sin(2*np.pi*freq * t + phases)
-        if prev_ctrl["val"] is None:
-            new_ctrl = SMOOTH_ALPHA * target
-        else:
-            new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
-        d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
-        prev_ctrl["val"] = d.ctrl.copy()
-    mj.set_mjcb_control(ctrl_fn)
-
-    mj.mj_resetData(model, data)
-    dt      = model.opt.timestep
-    n_steps = int(np.ceil(duration / dt))
-
-    history_xyz: List[np.ndarray] = [data.geom_xpos[core_gid].copy()]
-    steps = 0
-    for _ in range(n_steps):
-        mj.mj_step(model, data)
-        if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-            dist_bad = 1e6
-            return FitnessResult(fitness=-dist_bad, distance=dist_bad, reached=False, steps=steps), history_xyz
-        steps += 1
-        history_xyz.append(data.geom_xpos[core_gid].copy())
-
-    xt, yt, zt = TARGET_POSITION
-    xc, yc, zc = history_xyz[-1]
-    dist = float(np.sqrt((xt-xc)**2 + (yt-yc)**2 + (zt-zc)**2))
-    return FitnessResult(fitness=-dist, distance=dist, reached=(dist < 0.25), steps=steps), history_xyz
-
-def _ctrl_tournament_select(rng, pop_ctrl: List[ControllerGenome], fits: List[float], k: int) -> ControllerGenome:
-    idxs = rng.choice(len(pop_ctrl), size=min(k, len(pop_ctrl)), replace=False)
-    best_idx = max(idxs, key=lambda i: fits[i])
-    return pop_ctrl[best_idx]
-
-def _ctrl_crossover(rng, a: ControllerGenome, b: ControllerGenome) -> ControllerGenome:
-    return blend_ctrl_genome(rng, a, b)
-
-def _ctrl_mutate(rng, g: ControllerGenome, gen_idx: int, base_sigma=MUT_CTRL_SIGMA) -> ControllerGenome:
-    sigma = base_sigma * (0.98 ** gen_idx)
-    return mutate_ctrl_genome(rng, g, sigma=sigma)
-
-def evolve_controller_for_body(body: BodyGenome,
-                               rng_seed: int,
-                               pop_size: int = CTRL_INNER_POP,
-                               gens: int = CTRL_INNER_GENS,
-                               tourn_k: int = CTRL_INNER_K,
-                               elites: int = CTRL_INNER_ELITE,
-                               reuse_compiled: bool = True) -> Tuple[ControllerGenome, float]:
-    """
-    Inner EA that optimizes controllers for a fixed body.
-    Returns (best_controller, best_fitness).
-    """
-    rng = np.random.default_rng(rng_seed)
-    pop_ctrl = [sample_ctrl_genome(rng) for _ in range(pop_size)]
-
-    if reuse_compiled:
-        model, data, core_gid, graph, b_hash = _build_model_for_body(body)
-        use_fast = True
+def _prepare_matrix_from_genome(vec: np.ndarray, shape: tuple[int, int], rng: np.random.Generator) -> np.ndarray:
+    m, n = shape
+    need = m * n
+    base = np.asarray(vec, dtype=np.float64).ravel()
+    if base.size == 0:
+        base = np.array([0.0], dtype=np.float64)
+    if base.size < need:
+        reps = (need + base.size - 1) // base.size
+        base = np.tile(base, reps)[:need]
     else:
-        model = data = core_gid = b_hash = None
-        use_fast = False
+        base = base[:need]
+    mat = base.reshape(m, n)
+    mat = 0.0138 + 0.5 * (mat - 0.5) + 0.02 * rng.normal(size=mat.shape)
+    return mat
 
-    best_g: Optional[ControllerGenome] = None
-    best_fit: float = -np.inf
+def nn_controller(model: mj.MjModel, data: mj.MjData, body: Optional[BodyGenome]) -> np.ndarray:
+    input_size  = len(data.qpos)
+    hidden_size = 8
+    output_size = model.nu
+    if output_size == 0:
+        return np.zeros(0, dtype=np.float64)
 
-    for gidx in range(gens):
-        fits: List[float] = []
-        if use_fast:
-            for g in pop_ctrl:
-                fr, _ = _rollout_fixed_model(model, data, core_gid, g, b_hash, duration=SIM_DURATION)
-                fits.append(fr.fitness)
+    seed = 12345
+    if body is not None:
+        seed = int(1e6 * float(np.mean(body.type_p) + np.mean(body.conn_p) + np.mean(body.rot_p))) & 0x7FFFFFFF
+    rng = np.random.default_rng(seed ^ input_size ^ (hidden_size << 8) ^ (output_size << 16))
+
+    if body is not None:
+        w1 = _prepare_matrix_from_genome(body.type_p, (input_size,  hidden_size), rng)
+        w2 = _prepare_matrix_from_genome(body.conn_p, (hidden_size, hidden_size), rng)
+        w3 = _prepare_matrix_from_genome(body.rot_p,  (hidden_size, output_size), rng)
+    else:
+        w1 = 0.0138 + rng.normal(scale=0.5, size=(input_size, hidden_size))
+        w2 = 0.0138 + rng.normal(scale=0.5, size=(hidden_size, hidden_size))
+        w3 = 0.0138 + rng.normal(scale=0.5, size=(hidden_size, output_size))
+
+    x = np.asarray(data.qpos, dtype=np.float64)
+    h1 = np.tanh(x @ w1)
+    h2 = np.tanh(h1 @ w2)
+    y  = np.tanh(h2 @ w3)  # [-1,1]
+
+    if model.actuator_ctrlrange is not None and model.actuator_ctrlrange.size == 2 * output_size:
+        lo = model.actuator_ctrlrange[:, 0]
+        hi = model.actuator_ctrlrange[:, 1]
+        wid = hi - lo
+        wid[wid < 1e-9] = np.pi
+        target = lo + 0.5 * (y + 1.0) * wid
+    else:
+        target = (np.pi / 2.0) * y
+    return np.clip(target, -np.pi/2, np.pi/2)
+
+# ---- Simple CPG (coupled oscillators) ----
+class CPGState:
+    def __init__(self, nu: int):
+        self.phase = np.zeros(nu, dtype=np.float64)
+        # different natural frequencies to break symmetry
+        self.omega = 2*np.pi * (0.4 + 0.2*np.linspace(0,1,nu))
+        # small coupling matrix (nearest-neighbour ring)
+        self.K = 0.6
+        self.alpha = 0.05   # amplitude smoothing
+        self.amp = np.ones(nu, dtype=np.float64) * 0.6
+
+def cpg_controller_factory(model: mj.MjModel) -> callable:
+    nu = model.nu
+    state = CPGState(nu)
+    # choose actuator phases alternating to encourage gait
+    for i in range(nu):
+        state.phase[i] = (i % 2) * np.pi
+    last_time = {"t": 0.0}
+
+    def cpg_cb(m: mj.MjModel, d: mj.MjData, body: Optional[BodyGenome] = None):
+        # dt = time per step
+        t = d.time
+        dt = max(1e-4, t - last_time["t"])
+        last_time["t"] = t
+
+        # Kuramoto-like update on phases
+        phase = state.phase
+        for i in range(nu):
+            coupling = 0.0
+            if nu > 1:
+                coupling += np.sin(phase[(i-1) % nu] - phase[i])
+                coupling += np.sin(phase[(i+1) % nu] - phase[i])
+            dphi = state.omega[i] + state.K * coupling
+            phase[i] = (phase[i] + dphi * dt) % (2*np.pi)
+
+        # slowly adapt amplitudes based on joint limits (if available)
+        amp = state.amp
+        if m.actuator_ctrlrange is not None and m.actuator_ctrlrange.size == 2*nu:
+            lo = m.actuator_ctrlrange[:,0]; hi = m.actuator_ctrlrange[:,1]
+            span = hi - lo
+            span[span<1e-6] = 1.0
+            target_amp = 0.45 * span
+            amp += state.alpha * (target_amp - amp)
+
+        u = amp * np.sin(phase)
+        # hard clamp to ctrlrange or ±π/2
+        if m.actuator_ctrlrange is not None and m.actuator_ctrlrange.size == 2*nu:
+            lo = m.actuator_ctrlrange[:,0]; hi = m.actuator_ctrlrange[:,1]
+            d.ctrl[:nu] = np.clip(u, lo, hi)
         else:
-            for g in pop_ctrl:
-                fr, _ = rollout(body, g, duration=SIM_DURATION)
-                fits.append(fr.fitness)
+            d.ctrl[:nu] = np.clip(u, -np.pi/2, np.pi/2)
 
-        gen_best_i = int(np.argmax(fits))
-        if fits[gen_best_i] > best_fit:
-            best_fit = float(fits[gen_best_i])
-            best_g   = pop_ctrl[gen_best_i]
+    return cpg_cb
 
-        elite_idxs = np.argsort([-f for f in fits])[:elites]
-        elites_pop = [pop_ctrl[i] for i in elite_idxs]
+# =========================
+# Simulation helpers
+# =========================
+def fitness_function(history: List[List[float]]) -> float:
+    # history: list of [x,y,z]
+    xt, yt, zt = TARGET_POSITION
+    xc, yc, zc = history[-1]
+    return -float(np.sqrt((xt-xc)**2 + (yt-yc)**2 + (zt-zc)**2))
 
-        next_pop: List[ControllerGenome] = elites_pop.copy()
-        while len(next_pop) < pop_size:
-            p1 = _ctrl_tournament_select(rng, pop_ctrl, fits, k=tourn_k)
-            p2 = _ctrl_tournament_select(rng, pop_ctrl, fits, k=tourn_k)
-            child = _ctrl_crossover(rng, p1, p2)
-            child = _ctrl_mutate(rng, child, gen_idx=gidx)
-            next_pop.append(child)
-        pop_ctrl = next_pop
+def last_x(history: List[List[float]]) -> float:
+    return float(history[-1][0])
 
-    assert best_g is not None
-    return best_g, best_fit
+def experiment(
+    robot: Any,
+    controller: Controller,
+    duration: float = 15.0,
+    mode: ViewerTypes = "simple",
+    spawn_pos: List[float] = SPAWN_START,
+) -> Tuple[List[List[float]], float]:
+    """Run the simulation; return (xpos_history, sim_time)."""
+    mj.set_mjcb_control(None)
 
-# Memoization so the same body isn't re-solved repeatedly within a generation
-_body_hash_cache: dict[int, Tuple[ControllerGenome, float]] = {}
+    world = OlympicArena()
+    world.spawn(robot.spec, spawn_position=spawn_pos)
+    model = world.spec.compile()
+    data  = mj.MjData(model)
+    mj.mj_resetData(model, data)
 
-def _hash_body_genome(body: BodyGenome) -> int:
-    h = hashlib.blake2b(digest_size=8)
-    h.update(body.type_p.tobytes())
-    h.update(body.conn_p.tobytes())
-    h.update(body.rot_p.tobytes())
-    return int.from_bytes(h.digest(), 'little', signed=False)
+    if controller.tracker is not None:
+        controller.tracker.setup(world.spec, data)
 
-def evaluate_body_population(pop_bodies: List[BodyGenome],
-                             ctrl_budget_gens: int = CTRL_INNER_GENS,
-                             ctrl_budget_pop: int  = CTRL_INNER_POP) -> Tuple[List[float], List[ControllerGenome]]:
+    # choose callback wrapper (Controller wraps the user function)
+    mj.set_mjcb_control(lambda m, d: controller.set_control(m, d))
+
+    t0 = time.time()
+    if mode == "simple":
+        simple_runner(model, data, duration=duration)
+    elif mode == "launcher":
+        viewer.launch(model=model, data=data)
+    elif mode == "video":
+        path_to_video_folder = str(DATA / "videos")
+        video_recorder = VideoRecorder(output_folder=path_to_video_folder)
+        video_renderer(model, data, duration=duration, video_recorder=video_recorder)
+    elif mode == "frame":
+        save_path = str(DATA / "robot.png")
+        single_frame_renderer(model, data, save=True, save_path=save_path)
+    elif mode == "no_control":
+        mj.set_mjcb_control(None)
+        viewer.launch(model=model, data=data)
+
+    sim_time = time.time() - t0
+    return controller.tracker.history["xpos"][0], sim_time
+
+# ---------- Non-learner filter ----------
+def quick_motion_screen(body: BodyGenome, spawn: List[float]) -> bool:
+    """Short random/CPG rollout to kill non-learners early."""
+    try:
+        robot, _ = build_robot_from_body(body)
+    except Exception:
+        return False
+
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+
+    if USE_CPG:
+        # CPG screen (very cheap)
+        # build model to make the cpg callback (needs model.nu)
+        world = OlympicArena()
+        world.spawn(robot.spec, spawn_position=spawn)
+        model = world.spec.compile()
+        _ = mj.MjData(model)
+        cpg_cb = cpg_controller_factory(model)
+        ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,body=body), tracker=tracker)
+    else:
+        ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,body), tracker=tracker)
+
+    try:
+        hist, _ = experiment(robot=robot, controller=ctrl, duration=1.2, mode="simple", spawn_pos=spawn)
+        dx = last_x(hist) - spawn[0]
+        # Heuristic thresholds: must move a bit AND have some variance
+        return (dx > 0.05) and (np.std(np.diff(np.array(hist)[:,0])) > 1e-4)
+    except Exception:
+        return False
+
+# ---------- Dynamic duration schedule ----------
+def schedule_duration(best_progress_x: float) -> float:
     """
-    For each body in the population, run a small inner controller EA and
-    return its best fitness and the corresponding controller.
+    Increase allowed duration only when checkpoints are reached.
+    Checkpoints roughly: reach x>=0.0 (entering rugged), pass rugged x>=3.0, finish x>=5.0
     """
-    results_fits: List[float] = []
-    results_ctrls: List[ControllerGenome] = []
+    if best_progress_x < 0.0:
+        return 15.0
+    elif best_progress_x < 3.0:
+        return 45.0
+    else:
+        return 100.0
 
-    for i, body in enumerate(pop_bodies):
-        bh = _hash_body_genome(body)
-        if bh in _body_hash_cache:
-            best_ctrl, best_fit = _body_hash_cache[bh]
-        else:
-            seed = int((SEED + 10007*i) & 0x7FFFFFFF)
-            best_ctrl, best_fit = evolve_controller_for_body(
-                body, seed,
-                pop_size=ctrl_budget_pop,
-                gens=ctrl_budget_gens,
-                tourn_k=CTRL_INNER_K,
-                elites=CTRL_INNER_ELITE,
-                reuse_compiled=True,
-            )
-            _body_hash_cache[bh] = (best_ctrl, best_fit)
+# ---------- Multi-spawn curriculum ----------
+def choose_spawn(gen: int, rng: np.random.Generator) -> List[float]:
+    # Early gens: mostly start; later: mix in mid/late
+    if gen < 5:
+        return SPAWN_START
+    elif gen < 15:
+        return SPAWN_POS_LIST[rng.integers(0, 2)]  # start or mid
+    else:
+        return SPAWN_POS_LIST[rng.integers(0, 3)]  # any of 3
 
-        results_fits.append(best_fit)
-        results_ctrls.append(best_ctrl)
-    return results_fits, results_ctrls
+# ---------- Rollout & score (with curriculum & dynamic duration) ----------
+def rollout_and_score(body: BodyGenome, duration: float, spawn: List[float]) -> Tuple[float,float]:
+    """Return (fitness, last_x)."""
+    robot, _ = build_robot_from_body(body)
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
 
-def _body_tournament_select(rng, pop_bodies: List[BodyGenome], fits: List[float], k: int) -> BodyGenome:
-    idxs = rng.choice(len(pop_bodies), size=min(k, len(pop_bodies)), replace=False)
-    best_idx = max(idxs, key=lambda i: fits[i])
-    b = pop_bodies[best_idx]
-    return BodyGenome(b.type_p.copy(), b.conn_p.copy(), b.rot_p.copy())
+    if USE_CPG:
+        # need a model to size the CPG
+        world = OlympicArena()
+        world.spawn(robot.spec, spawn_position=spawn)
+        model = world.spec.compile()
+        _ = mj.MjData(model)
+        cpg_cb = cpg_controller_factory(model)
+        ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,body=body), tracker=tracker)
+    else:
+        ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,body), tracker=tracker)
 
-def _body_crossover(rng, a: BodyGenome, b: BodyGenome) -> BodyGenome:
-    return blend_body_genome(rng, a, b)
+    hist, _sim_t = experiment(robot=robot, controller=ctrl, duration=duration, mode="simple", spawn_pos=spawn)
+    fit = fitness_function(hist)
+    px  = last_x(hist)
+    return fit, px
 
-def _body_mutate(rng, g: BodyGenome, gen_idx: int, base_sigma=MUT_BODY_SIGMA) -> BodyGenome:
-    sigma = base_sigma * (0.97 ** gen_idx)
-    return mutate_body_genome(rng, g, sigma=sigma)
+# ---------- Tournament selection ----------
+def tournament_select(rng: np.random.Generator, pop: List[BodyGenome], k=TOURNAMENT_K) -> BodyGenome:
+    idxs = rng.choice(len(pop), size=min(k, len(pop)), replace=False)
+    best_idx = max(idxs, key=lambda i: pop[i].fitness)
+    return pop[best_idx]
 
-def evolve_bodies_then_controllers(
-        outer_pop_size: int = POP_SIZE,
-        outer_gens: int = GENERATIONS,
-        outer_k: int = TOURNAMENT_K,
-        outer_elites: int = ELITES,
-        inner_pop: int = CTRL_INNER_POP,
-        inner_gens: int = CTRL_INNER_GENS
-    ) -> Tuple[BodyGenome, ControllerGenome, FitnessResult, List[float], List[float]]:
-    """
-    Outer EA over bodies. Each body's fitness = best controller fitness
-    obtained by an inner controller EA with a small budget.
-    Returns best body, its refined best controller and final FitnessResult, plus curves.
-    """
+# ---------- Persistence ----------
+STATE_PATH = DATA / "evo_state.pkl"
+CURVES_PATH = DATA / "curves.pkl"
+BEST_JSON_PATH = DATA / "best_body.json"
+BEST_CTRL_PATH = DATA / "best_ctrl.pkl"  # placeholder if you later evolve controllers
+
+def save_state(gen: int, population: List[BodyGenome], best: BodyGenome, gen_curve: List[float], overall_curve: List[float], best_progress: float):
+    # store minimal info to resume
+    state = {
+        "gen": gen,
+        "population": [(ind.type_p, ind.conn_p, ind.rot_p, ind.fitness, ind.progress_x) for ind in population],
+        "best": (best.type_p, best.conn_p, best.rot_p, best.fitness, best.progress_x),
+        "best_progress_x": best_progress,
+    }
+    with open(STATE_PATH, "wb") as f:
+        pickle.dump(state, f)
+    with open(CURVES_PATH, "wb") as f:
+        pickle.dump({"gen_best": gen_curve, "overall_best": overall_curve}, f)
+    if SAVE_GRAPH_AND_BEST:
+        try:
+            core, graph = build_robot_from_body(best)
+            save_graph_as_json(graph, BEST_JSON_PATH)
+        except Exception:
+            pass
+
+def load_state() -> Tuple[int, List[BodyGenome], BodyGenome, List[float], List[float], float]:
+    if not STATE_PATH.exists():
+        raise FileNotFoundError
+    with open(STATE_PATH, "rb") as f:
+        s = pickle.load(f)
+    pop = []
+    for (tp, cp, rp, fit, px) in s["population"]:
+        ind = BodyGenome(tp.astype(np.float32), cp.astype(np.float32), rp.astype(np.float32), float(fit), float(px))
+        pop.append(ind)
+    bt = s["best"]
+    best = BodyGenome(bt[0].astype(np.float32), bt[1].astype(np.float32), bt[2].astype(np.float32), float(bt[3]), float(bt[4]))
+    if CURVES_PATH.exists():
+        with open(CURVES_PATH, "rb") as f:
+            curves = pickle.load(f)
+        gen_curve = curves.get("gen_best", [])
+        overall_curve = curves.get("overall_best", [])
+    else:
+        gen_curve, overall_curve = [], []
+    best_progress_x = float(s.get("best_progress_x", 0.0))
+    return int(s["gen"]), pop, best, gen_curve, overall_curve, best_progress_x
+
+# ---------- Evaluation (multiprocessing) ----------
+def _worker_eval(args):
+    ind, duration, spawn = args
+    try:
+        fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
+        return (fit, px)
+    except Exception:
+        return (-1e9, -1e9)
+
+def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float,float]]:
+    # choose spawn per evaluation to encourage generalisation
+    spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
+    # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
+    from multiprocessing import Pool
+    with Pool(processes=min(MAX_PROCESSES, len(pop))) as pool:
+        results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
+    return results
+
+# ---------- Initial population with non-learner filter ----------
+def init_population(rng: np.random.Generator, size: int) -> List[BodyGenome]:
+    pop = []
+    trials = 0
+    while len(pop) < size and trials < size * 20:
+        g = sample_body_genome(rng)
+        spawn = SPAWN_START
+        if quick_motion_screen(g, spawn):
+            pop.append(g)
+        trials += 1
+    # Fallback: if too strict, fill remaining slots without screen
+    while len(pop) < size:
+        pop.append(sample_body_genome(rng))
+    return pop
+
+# ---------- Evolve ----------
+def evolve(total_generations: int = GENERATIONS, run_one_generation: bool = RUN_ONE_GENERATION):
     rng = np.random.default_rng(SEED)
-    pop_bodies: List[BodyGenome] = [sample_body_genome(rng) for _ in range(outer_pop_size)]
 
-    best_body: Optional[BodyGenome] = None
-    best_ctrl_for_best_body: Optional[ControllerGenome] = None
-    best_fit_value: float = -np.inf
+    # Resume or init
+    try:
+        start_gen, population, best_body, gen_best_curve, overall_best_curve, best_progress_x = load_state()
+        console.log(f"[Resume] Loaded generation {start_gen}, best fitness {best_body.fitness:.4f}, best progress x={best_progress_x:.2f}")
+        gen0 = start_gen
+    except FileNotFoundError:
+        population = init_population(rng, POP_SIZE)
+        best_body = population[0]
+        best_body.fitness = -np.inf
+        gen_best_curve = []
+        overall_best_curve = []
+        best_progress_x = 0.0
+        gen0 = 0
 
-    gen_best_curve: List[float] = []
-    overall_best_curve: List[float] = []
+    max_generations_to_run = 1 if run_one_generation else (total_generations - gen0)
+    for gen in range(gen0, min(total_generations, gen0 + max_generations_to_run)):
+        # dynamic duration based on best progress so far
+        duration = schedule_duration(best_progress_x)
+        console.log(f"Generation {gen+1}/{total_generations} — duration={duration:.1f}s")
 
-    for gen in range(outer_gens):
-        body_fits, body_ctrls = evaluate_body_population(pop_bodies, ctrl_budget_gens=inner_gens, ctrl_budget_pop=inner_pop)
+        # Evaluate
+        results = evaluate_population(population, duration=duration, gen=gen)
+        for ind, (fit, px) in zip(population, results):
+            ind.fitness = fit
+            ind.progress_x = px
 
-        gen_best_idx = int(np.argmax(body_fits))
-        gen_best_fit_val = float(body_fits[gen_best_idx])
-        gen_best_body = pop_bodies[gen_best_idx]
-        gen_best_ctrl = body_ctrls[gen_best_idx]
+        population.sort(key=lambda ind: ind.fitness, reverse=True)
+        gen_best = population[0].fitness
+        gen_best_curve.append(gen_best)
 
-        if gen_best_fit_val > best_fit_value:
-            best_fit_value = gen_best_fit_val
-            best_body = BodyGenome(gen_best_body.type_p.copy(),
-                                   gen_best_body.conn_p.copy(),
-                                   gen_best_body.rot_p.copy())
-            best_ctrl_for_best_body = ControllerGenome(
-                gen_best_ctrl.frequency, gen_best_ctrl.amp_mean, gen_best_ctrl.amp_std,
-                gen_best_ctrl.phase_mean, gen_best_ctrl.phase_std, gen_best_ctrl.seed
-            )
+        if gen_best > best_body.fitness:
+            best_body = population[0]
+            best_progress_x = max(best_progress_x, best_body.progress_x)
 
-        print(f"[Outer Gen {gen+1:02d}] best_f={gen_best_fit_val:.3f}")
+        overall_best_curve.append(best_body.fitness)
+        console.log(f"  Best gen fit: {gen_best:.4f} | Overall best: {best_body.fitness:.4f} | Best x: {best_progress_x:.2f}")
 
-        gen_best_curve.append(gen_best_fit_val)
-        overall_best_curve.append(best_fit_value)
+        # Save state each generation
+        save_state(gen+1, population, best_body, gen_best_curve, overall_best_curve, best_progress_x)
 
-        elite_idxs = np.argsort([-f for f in body_fits])[:outer_elites]
-        elites_bodies = [pop_bodies[i] for i in elite_idxs]
+        # Reproduce (elitism + SBX + mutation)
+        new_population: List[BodyGenome] = population[:ELITES]
+        # elites copied (no mutation) — but keep as-is to stabilize
+        while len(new_population) < POP_SIZE:
+            p1 = tournament_select(rng, population)
+            p2 = tournament_select(rng, population)
+            child = crossover_sbx_linked(rng, p1, p2)
+            sigma = float(MUT_BODY_SIGMA * (0.98 ** (gen - gen0)))
+            child = mutate_body_genome(rng, child, sigma=sigma)
+            # soft screen during reproduction (to avoid filling with duds)
+            if quick_motion_screen(child, choose_spawn(gen, rng)):
+                new_population.append(child)
 
-        next_bodies: List[BodyGenome] = [BodyGenome(b.type_p.copy(), b.conn_p.copy(), b.rot_p.copy())
-                                         for b in elites_bodies]
-        while len(next_bodies) < outer_pop_size:
-            p1 = _body_tournament_select(rng, pop_bodies, body_fits, k=outer_k)
-            p2 = _body_tournament_select(rng, pop_bodies, body_fits, k=outer_k)
-            child = _body_crossover(rng, p1, p2)
-            child = _body_mutate(rng, child, gen_idx=gen)
-            next_bodies.append(child)
+        population = new_population
 
-        pop_bodies = next_bodies
+    return best_body, gen_best_curve, overall_best_curve
 
-    assert best_body is not None and best_ctrl_for_best_body is not None
+# ---------- Plotting / viz ----------
+def show_xpos_history(history: List[List[float]]) -> None:
+    camera = mj.MjvCamera()
+    camera.type = mj.mjtCamera.mjCAMERA_FREE
+    camera.lookat = [2.5, 0, 0]
+    camera.distance = 10
+    camera.azimuth = 0
+    camera.elevation = -90
 
-    # Final, larger controller optimization for the best body
-    print("\n[Final Controller Refinement] Starting larger inner EA on the best body...")
-    final_ctrl, final_fit_val = evolve_controller_for_body(
-        best_body, rng_seed=SEED + 99991,
-        pop_size=CTRL_FINAL_POP, gens=CTRL_FINAL_GENS,
-        tourn_k=CTRL_FINAL_K, elites=CTRL_FINAL_ELITE, reuse_compiled=True
-    )
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+    model = world.spec.compile()
+    data = mj.MjData(model)
+    save_path = str(DATA / "background.png")
+    single_frame_renderer(model, data, camera=camera, save_path=save_path, save=True)
 
-    final_fit, _ = rollout(best_body, final_ctrl, duration=SIM_DURATION)
+    img = plt.imread(save_path)
+    _, ax = plt.subplots()
+    ax.imshow(img)
+    w, h, _ = img.shape
 
-    print(f"=== Hierarchical evolution complete ===")
-    print(f"Best hierarchical fitness: {final_fit.fitness:.3f} | dist={final_fit.distance:.3f} | reached={final_fit.reached}")
+    pos_data = np.array(history)
+    x0, y0 = int(h * 0.483), int(w * 0.815)
+    xc, yc = int(h * 0.483), int(w * 0.9205)
+    ym0, ymc = 0, SPAWN_START[0]
+    pixel_to_dist = -((ymc - ym0) / (yc - y0))
+    pos_data_pixel = [[xc, yc]]
+    for i in range(len(pos_data) - 1):
+        xi, yi, _ = pos_data[i]
+        xj, yj, _ = pos_data[i + 1]
+        xd, yd = (xj - xi) / pixel_to_dist, (yj - yi) / pixel_to_dist
+        xn, yn = pos_data_pixel[i]
+        pos_data_pixel.append([xn + int(xd), yn + int(yd)])
+    pos_data_pixel = np.array(pos_data_pixel)
 
-    return best_body, final_ctrl, final_fit, gen_best_curve, overall_best_curve
-
-# =========================
-# Save / Viz
-# =========================
-def save_best_hier(best_body: BodyGenome, best_ctrl: ControllerGenome,
-                   final_fit: FitnessResult,
-                   gen_curve: List[float], overall_curve: List[float],
-                   tag: str = "hierarchical"):
-    core, graph = build_robot_from_body(best_body)
-    json_path = OUT_DIR / f"best_body_{tag}.json"
-    save_graph_as_json(graph, str(json_path))
-
-    with open(OUT_DIR / f"best_ctrl_{tag}.pkl", "wb") as f:
-        pickle.dump(best_ctrl, f)
-    with open(OUT_DIR / f"best_fit_{tag}.pkl", "wb") as f:
-        pickle.dump(final_fit, f)
-    with open(OUT_DIR / f"gen_best_curve_{tag}.pkl", "wb") as f:
-        pickle.dump(gen_curve, f)
-    with open(OUT_DIR / f"overall_best_curve_{tag}.pkl", "wb") as f:
-        pickle.dump(overall_curve, f)
-
-    console.log(f"[hier] Saved best body JSON → {json_path}")
-    console.log(f"[hier] Saved controller + curves in {OUT_DIR}")
-
-def plot_curves(gen_best_curve: List[float], overall_best_curve: List[float], title="Hierarchical EA (−distance to target)"):
-    plt.figure(figsize=(8,5))
-    plt.plot(gen_best_curve, label="Gen best (outer)")
-    plt.plot(overall_best_curve, "--", label="Overall best (outer)")
-    plt.xlabel("Outer Generation"); plt.ylabel("Fitness (higher is better)")
-    plt.grid(True); plt.legend()
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "fitness_curves_hierarchical.png", dpi=200)
+    ax.plot(x0, y0, "kx", label="[0, 0, 0]")
+    ax.plot(xc, yc, "go", label="Start")
+    ax.plot(pos_data_pixel[:, 0], pos_data_pixel[:, 1], "b-", label="Path")
+    ax.plot(pos_data_pixel[-1, 0], pos_data_pixel[-1, 1], "ro", label="End")
+    ax.set_xlabel("X Position")
+    ax.set_ylabel("Y Position")
+    ax.legend()
+    plt.title("Robot Path in XY Plane")
     plt.show()
 
-# =========================
-# Robust loader (if you later want to view saved best)
-# =========================
-def load_graph_from_json_robust(json_path: Path) -> "nx.DiGraph":
-    with open(json_path, "r", encoding="utf-8") as f:
-        body_json = json.load(f)
+# ---------- MuJoCo warning silencer ----------
+# DOESN'T FUCKING WORK FOR SOME GODDAMN REASON
+class _FilterStderr(io.TextIOBase):
+    def __init__(self, real_stderr, log_path: Path):
+        self._real = real_stderr
+        self._log = open(log_path, "a", buffering=1, encoding="utf-8")
+        self._buf = ""
+
+    def write(self, s):
+        # Buffer until newline to filter linewise
+        self._buf += s
+        out = []
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if "WARNING: " in line:
+                # divert to file only
+                self._log.write(line + "\n")
+            else:
+                out.append(line + "\n")
+        if out:
+            return self._real.write("".join(out))
+        return 0
+
+    def flush(self):
+        self._real.flush()
+        self._log.flush()
+
+    def close(self):
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        return super().close()
+
+@contextlib.contextmanager
+def silence_mujoco_warnings():
+    filt = _FilterStderr(sys.stderr, WARN_LOG)
+    old = sys.stderr
+    sys.stderr = filt
     try:
-        hpd = HighProbabilityDecoder(NUM_OF_MODULES)
-        graph = hpd.json_to_graph(body_json)  # if provided by your HPD
-        return graph
-    except Exception:
-        return json_graph.node_link_graph(body_json)
+        yield
+    finally:
+        sys.stderr = old
+        try:
+            filt.close()
+        except Exception:
+            pass
 
-# =========================
-# Main
-# =========================
-def main(mode: Literal["hierarchical", "viewer_saved"] = "hierarchical",
-         save_video: bool = False) -> None:
-    if mode == "hierarchical":
-        best_body, best_ctrl, final_fit, gen_curve, overall_curve = evolve_bodies_then_controllers()
+# ---------- Main ----------
+def main() -> None:
+    with silence_mujoco_warnings():
+        best_body, gen_best_curve, overall_best_curve = evolve()
 
-        # Launch viewer on the best hierarchical solution
-        mj.set_mjcb_control(None)
-        world = OlympicArena()
+        # Build best body & save artifacts
         core, graph = build_robot_from_body(best_body)
-        world.spawn(core.spec, spawn_position=SPAWN_POS)
-        model = world.spec.compile()
-        harden_model(model)
-        data  = mj.MjData(model)
+        if SAVE_GRAPH_AND_BEST:
+            save_graph_as_json(graph, DATA / "robot_graph.json")
 
-        tmp_json = str(OUT_DIR / "_tmp_best_hier_view.json")
-        save_graph_as_json(graph, tmp_json)
-        b_hash = body_fingerprint(tmp_json)
-        amps, phases, freq = expand_per_joint_params(model, best_ctrl, b_hash)
+        # Quick demo rollout from full start, using chosen controller
+        tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+        if USE_CPG:
+            # Need model to size CPG callback
+            world = OlympicArena()
+            world.spawn(core.spec, spawn_position=SPAWN_START)
+            model = world.spec.compile()
+            _ = mj.MjData(model)
+            cpg_cb = cpg_controller_factory(model)
+            ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,best_body), tracker=tracker)
+        else:
+            ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,best_body), tracker=tracker)
 
-        prev_ctrl = {"val": None}
-        def ctrl_fn(m, d):
-            t = d.time
-            target = amps * (np.pi/2) * np.sin(2*np.pi*freq * t + phases)
-            if prev_ctrl["val"] is None:
-                new_ctrl = SMOOTH_ALPHA * target
-            else:
-                new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
-            d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
-            prev_ctrl["val"] = d.ctrl.copy()
+        # Choose duration based on current best progress
+        try:
+            _, _, _, _, _, best_px = load_state()
+        except Exception:
+            best_px = 0.0
+        demo_duration = schedule_duration(best_px)
 
-        mj.set_mjcb_control(ctrl_fn)
-        viewer.launch(model=model, data=data)
+        experiment(robot=core, controller=ctrl, duration=demo_duration, mode="launcher", spawn_pos=SPAWN_START)
 
-        save_best_hier(best_body, best_ctrl, final_fit, gen_curve, overall_curve, tag="hierarchical")
-        plot_curves(gen_curve, overall_curve, title="Hierarchical EA (outer body EA, inner controller EA)")
+        # Plot curves (if you run multiple gens, these will show growth)
+        if len(gen_best_curve) and len(overall_best_curve):
+            plt.figure()
+            plt.plot(gen_best_curve, label="Gen Best")
+            plt.plot(overall_best_curve, label="Overall Best")
+            plt.xlabel("Generation")
+            plt.ylabel("Fitness (−distance)")
+            plt.legend()
+            plt.title("Fitness Curves")
+            plt.tight_layout()
+            plt.savefig(DATA / "fitness_curves.png", dpi=150)
+            console.log(f"Saved curves → {DATA / 'fitness_curves.png'}")
 
-        if save_video:
-            _ = rollout(best_body, best_ctrl, duration=min(5.0, SIM_DURATION), record_path="best_hierarchical")
-            console.log("Saved video to outputs/.")
+        # Optional trajectory viz if just ran a demo
+        # show_xpos_history(tracker.history["xpos"][0])
 
-    elif mode == "viewer_saved":
-        json_path = OUT_DIR / "best_body_hierarchical.json"
-        ctrl_path = OUT_DIR / "best_ctrl_hierarchical.pkl"
-        if not json_path.exists() or not ctrl_path.exists():
-            raise FileNotFoundError("Saved hierarchical artifacts not found.")
-        graph = load_graph_from_json_robust(json_path)
-        core = construct_mjspec_from_graph(graph)
-        with open(ctrl_path, "rb") as f:
-            ctrl = pickle.load(f)
-        if isinstance(ctrl, dict):
-            ctrl = ControllerGenome(**ctrl)
-
-        mj.set_mjcb_control(None)
-        world = OlympicArena()
-        world.spawn(core.spec, spawn_position=SPAWN_POS)
-        model = world.spec.compile()
-        harden_model(model)
-        data  = mj.MjData(model)
-
-        b_hash = body_fingerprint(str(json_path))
-        amps, phases, freq = expand_per_joint_params(model, ctrl, b_hash)
-
-        prev_ctrl = {"val": None}
-        def ctrl_fn(m, d):
-            t = d.time
-            target = amps * (np.pi/2) * np.sin(2*np.pi*freq * t + phases)
-            if prev_ctrl["val"] is None:
-                new_ctrl = SMOOTH_ALPHA * target
-            else:
-                new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
-            d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
-            prev_ctrl["val"] = d.ctrl.copy()
-
-        mj.set_mjcb_control(ctrl_fn)
-        viewer.launch(model=model, data=data)
+        console.log(f"Best fitness so far: {overall_best_curve[-1]:.4f}" if overall_best_curve else "Run complete.")
+        console.log(f"MuJoCo warnings (if any) logged at: {WARN_LOG}")
 
 if __name__ == "__main__":
-    # Run the hierarchical pipeline by default
-    main(mode="hierarchical", save_video=False)
+    # On windows/mp start method guard
+    try:
+        import multiprocessing as _mp
+        if hasattr(_mp, "set_start_method"):
+            _mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
+    main()
