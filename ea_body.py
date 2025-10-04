@@ -35,6 +35,7 @@ from ariel.simulation.environments import OlympicArena
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.video_recorder import VideoRecorder
+import multiprocessing
 
 # =========================
 # Config & Paths
@@ -43,9 +44,9 @@ SEED = 42
 RNG = np.random.default_rng(SEED)
 
 # Evolution hyperparams
-POP_SIZE       = 100
+POP_SIZE       = 10
 ELITES         = max(1, POP_SIZE // 10)
-GENERATIONS    = 100
+GENERATIONS    = 3
 TOURNAMENT_K   = 10
 MUT_BODY_SIGMA = 0.10     # Gaussian noise on NDE input vectors (clipped to [0,1])
 MUT_CTRL_SIGMA = 0.15     # Gaussian noise on controller genes
@@ -439,11 +440,15 @@ def tournament_select(rng: np.random.Generator, pop: List[Individual], fits: Lis
     best_idx = max(idxs, key=lambda i: fits[i].fitness)
     return pop[best_idx]
 
+def rollout_worker(ind):
+    fit, _ = rollout(ind, duration=SIM_DURATION)
+    return fit
+
 def evaluate_population(pop: List[Individual]) -> List[FitnessResult]:
-    results: List[FitnessResult] = []
-    for ind in pop:
-        fit, _ = rollout(ind, duration=SIM_DURATION)
-        results.append(fit)
+    # Helper for pool: must be top-level function
+
+    with multiprocessing.Pool() as pool:
+        results = pool.map(rollout_worker, pop)
     return results
 
 def evolve() -> Tuple[Individual, FitnessResult, List[float], List[float]]:
@@ -552,6 +557,130 @@ def load_graph_from_json_robust(json_path: Path) -> "nx.DiGraph":
         return json_graph.node_link_graph(body_json)
 
 
+
+
+def make_best_guess_body(NUM_OF_MODULES: int = 10,
+                         n_types: int = 4,     # 0=Core,1=Hinge,2=Brick,3=Touch (optional)
+                         n_rots: int = 4):     # 0,90,180,270 degrees
+    """
+    Returns (type_p, conn_p, rot_p) as well-formed probability matrices.
+    Shapes:
+      type_p: (N, n_types) row-stochastic
+      conn_p: (N, N) row-stochastic (who each module attaches to; 0=Core preferred target)
+      rot_p : (N, n_rots) row-stochastic
+    """
+
+    N = NUM_OF_MODULES
+    T = n_types
+    R = n_rots
+
+    # --- TYPE PROBABILITIES ---
+    type_p = np.full((N, T), 1e-6, dtype=float)
+
+    # Module 0 is the core (confident one-hot)
+    type_p[0, :] = 1e-6
+    type_p[0, 0] = 1.0
+
+    # Chain of 4 after core: Hinge -> Brick -> Hinge -> Brick
+    # Remaining modules: small side branches with hinges + optional sensors
+    chain_pattern = [1, 2, 1, 2]   # Hinge, Brick, Hinge, Brick
+    for i in range(1, min(N, 1 + len(chain_pattern))):
+        type_p[i, :] = 1e-6
+        type_p[i, chain_pattern[i-1]] = 1.0
+
+    # Side branches start at indices 5..N-1 (if available)
+    for i in range(5, N):
+        # Prefer hinge with high prob, allow brick/sensor with tiny mass for decoder fallback
+        type_p[i, :] = 1e-6
+        type_p[i, 1] = 0.98  # hinge
+        if T >= 3:
+            type_p[i, 2] = 0.02  # brick
+        # if T == 4 and you want light sensing bumps, sprinkle a tiny prob:
+        if T >= 4:
+            type_p[i, 3] = 1e-4
+
+    # Normalize (defensive; they’re already one-hot or near)
+    type_p = type_p / type_p.sum(axis=1, keepdims=True)
+
+    # --- CONNECTION PROBABILITIES ---
+    # Build a mostly-tree structure:
+    #  - Core (0) is parent.
+    #  - Linear chain: 1<-0, 2<-1, 3<-2, 4<-3
+    #  - Side branches from core: 5<-0 and 7<-0 (if exist)
+    #  - Small twigs off chain: 6<-2 and 8<-3 (if exist)
+    conn_p = np.full((N, N), 1e-9, dtype=float)
+
+    # helper to set a strong parent preference
+    def attach(child, parent, p=0.995):
+        conn_p[child, :] = (1.0 - p) / (N - 1)
+        conn_p[child, parent] = p
+
+    # Root/core “connects to itself” with high prob (or a mild spread to keep decoder happy)
+    conn_p[0, :] = 1e-12
+    conn_p[0, 0] = 1.0
+
+    # Chain 1-4
+    if N > 1: attach(1, 0)
+    if N > 2: attach(2, 1)
+    if N > 3: attach(3, 2)
+    if N > 4: attach(4, 3)
+
+    # Side branches
+    if N > 5: attach(5, 0, p=0.99)
+    if N > 6: attach(6, 2, p=0.99)
+    if N > 7: attach(7, 0, p=0.99)
+    if N > 8: attach(8, 3, p=0.99)
+    for i in range(9, N):
+        # extra leaves hung near mid-chain to keep footprint compact
+        parent = 2 if i % 2 == 1 else 3
+        attach(i, parent, p=0.985)
+
+    # Normalize rows (defensive)
+    conn_p = conn_p / conn_p.sum(axis=1, keepdims=True)
+
+    # --- ROTATION PROBABILITIES ---
+    # Keep most modules at 0° to reduce leverage/instability.
+    # Give hinges a small chance of 90° to enable lateral DOFs.
+    rot_p = np.full((N, R), 1e-6, dtype=float)
+
+    def set_rot(i, main=0, eps=1e-3):
+        rot_p[i, :] = eps
+        rot_p[i, main] = 1.0
+        rot_p[i, :] /= rot_p[i, :].sum()
+
+    # Core
+    set_rot(0, main=0)
+
+    # Chain: alternate small 90° bias on hinges to allow turning gait
+    for i in range(1, min(N, 5)):
+        # if it's a hinge (pattern indices 1 or 3), bias to 90°, else 0°
+        is_hinge = chain_pattern[i-1] == 1
+        if is_hinge:
+            # 85% at 0°, 15% at 90° – stable but allows asymmetry
+            rot_p[i, :] = 1e-6
+            rot_p[i, 0] = 0.85
+            if R >= 2:
+                rot_p[i, 1] = 0.15
+            rot_p[i, :] /= rot_p[i, :].sum()
+        else:
+            set_rot(i, main=0)
+
+    # Side modules: keep simple
+    for i in range(5, N):
+        set_rot(i, main=0)
+
+    return type_p, conn_p, rot_p
+
+
+# Then set your genotype fields:
+# body.type_p = type_p
+# body.conn_p = conn_p
+# body.rot_p  = rot_p
+# p_mats = nde.forward([body.type_p, body.conn_p, body.rot_p])
+# graph  = hpd.probability_matrices_to_graph(p_mats[0], p_mats[1], p_mats[2])
+# core   = construct_mjspec_from_graph(graph)
+
+
 # =========================
 # Main
 # =========================
@@ -645,6 +774,38 @@ def main(mode: Literal["evolve", "viewer", "load_best"] = "evolve", save_video: 
         mj.set_mjcb_control(ctrl_fn)
         viewer.launch(model=model, data=data)
 
+    # elif mode == "try_custom":
+    #     # Example usage:
+    #     NUM_OF_MODULES = 10
+    #     type_p, conn_p, rot_p = make_best_guess_body(NUM_OF_MODULES)
+    #     body = BodyGenome(type_p=type_p, conn_p=conn_p, rot_p=rot_p)
+    #     world = OlympicArena()
+    #     core, graph = build_robot_from_body(ind.body)
+    #     world.spawn(core.spec, spawn_position=SPAWN_POS)
+    #     model = world.spec.compile()
+    #     data  = mj.MjData(model)
+
+    #     tmp_json = str(OUT_DIR / "_tmp_view.json")
+    #     save_graph_as_json(graph, tmp_json)
+    #     b_hash = body_fingerprint(tmp_json)
+    #     amps, phases, freq = expand_per_joint_params(model, ind.ctrl, b_hash)
+
+    #     prev_ctrl = {"val": None}
+    #     def ctrl_fn(m, d):
+    #         t = d.time
+    #         target = amps * (np.pi/2) * np.sin(2*np.pi*freq * t + phases)
+    #         if prev_ctrl["val"] is None:
+    #             new_ctrl = SMOOTH_ALPHA * target
+    #         else:
+    #             new_ctrl = (1.0 - SMOOTH_ALPHA) * prev_ctrl["val"] + SMOOTH_ALPHA * target
+    #         d.ctrl[:] = np.clip(new_ctrl, CTRL_MIN, CTRL_MAX)
+    #         prev_ctrl["val"] = d.ctrl.copy()
+
+    #     mj.set_mjcb_control(ctrl_fn)
+    #     viewer.launch(model=model, data=data)
+
+
+
     else:  # "viewer" -> random individual quick demo
         ind = sample_individual(RNG)
         print(ind)
@@ -683,3 +844,4 @@ if __name__ == "__main__":
     main(mode="evolve")
     # main(mode="load_best")
     # main(mode="evolve", save_video=True)
+    # main(mode="try_custom")
