@@ -1,5 +1,7 @@
-"""Assignment 3 template code — with non-learner filter, dynamic duration,
-multi-spawn training, per-generation save/resume, CPG option, and warning capture.
+"""
+Assignment 3 template code — with non-learner filter, dynamic duration,
+multi-spawn training, per-generation save/resume, CPG option, warning capture,
+AND: Initialize with NDE Genotypes, then evolve with a Graph-based EA.
 """
 
 # === Standard library
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 import contextlib
 import time
 import multiprocessing as mp
+import hashlib
 
 # === Third-party
 import numpy as np
@@ -22,6 +25,8 @@ import numpy.typing as npt
 import matplotlib.pyplot as plt
 import mujoco as mj
 from mujoco import viewer
+import networkx as nx
+from networkx.readwrite import json_graph
 
 # === Local libraries
 from ariel import console
@@ -43,7 +48,7 @@ if TYPE_CHECKING:
 
 # ---------- Config toggles ----------
 USE_CPG: bool = False            # switch to CPG for speedier learning
-RUN_ONE_GENERATION: bool = True # run a single generation per execution (resume later)
+RUN_ONE_GENERATION: bool = True  # run a single generation per execution (resume later)
 SAVE_GRAPH_AND_BEST: bool = True
 MAX_PROCESSES: int = 15          # cap multiprocessing
 
@@ -51,7 +56,7 @@ MAX_PROCESSES: int = 15          # cap multiprocessing
 SEED = 42
 RNG = np.random.default_rng(SEED)
 
-SCRIPT_NAME = __file__.split("/")[-1][:-3]
+SCRIPT_NAME = __file__.split("/")[-1][:-3] if "__file__" in globals() else "graph_ea_full"
 CWD = Path.cwd()
 DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(parents=True, exist_ok=True)
@@ -83,11 +88,11 @@ ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 # =========================
 # Body genome (NDE inputs)
 # =========================
-@dataclass
-class BodyGenome:
-    type_p: np.ndarray   # float32 in [0,1], shape (GENOTYPE_SIZE,)
-    conn_p: np.ndarray   # float32 in [0,1]
-    rot_p:  np.ndarray   # float32 in [0,1]
+
+@dataclass 
+class GraphBody:
+    core: Any
+    graph: DiGraph
     fitness: float = -np.inf
     progress_x: float = 0.0
 
@@ -97,7 +102,6 @@ def sample_body_genome(rng: np.random.Generator) -> BodyGenome:
         conn_p = rng.random(GENOTYPE_SIZE, dtype=np.float32),
         rot_p  = rng.random(GENOTYPE_SIZE, dtype=np.float32),
     )
-
 
 # =========================
 # Build, control, fitness
@@ -109,36 +113,6 @@ def build_robot_from_body(body: BodyGenome):
     graph = hpd.probability_matrices_to_graph(p_mats[0], p_mats[1], p_mats[2])
     core = construct_mjspec_from_graph(graph)
     return core, graph
-
-def plot_graph(graph):
-    pos = nx.spring_layout(graph)
-    plt.figure(figsize=(8, 6))
-    nx.draw(graph, pos, with_labels=True, node_color='lightblue', edge_color='gray', node_size=500, font_size=10)
-    plt.title("Robot Body Graph")
-    plt.show()
-# def mutate_body_genome(rng: np.random.Generator, g: BodyGenome, sigma: float=MUT_BODY_SIGMA) -> BodyGenome:
-#     def mut(x):
-#         y = x.astype(np.float32) + rng.normal(0.0, sigma, size=x.shape).astype(np.float32)
-#         return np.clip(y, 0.0, 1.0).astype(np.float32)
-#     return BodyGenome(mut(g.type_p), mut(g.conn_p), mut(g.rot_p))
-
-# def _sbx_pair(rng, x, y, eta: float = 15.0):
-#     u = rng.random(x.shape)
-#     beta = np.where(u <= 0.5, (2*u)**(1/(eta+1)), (1/(2*(1-u)))**(1/(eta+1)))
-#     c1 = 0.5*((1+beta)*x + (1-beta)*y)
-#     c2 = 0.5*((1-beta)*x + (1+beta)*y)
-#     choose = rng.random(x.shape) < 0.5
-#     child = np.where(choose, c1, c2)
-#     return np.clip(child, 0.0, 1.0)
-
-# def crossover_sbx_linked(rng: np.random.Generator, a: BodyGenome, b: BodyGenome, eta: float = 15.0) -> BodyGenome:
-#     return BodyGenome(
-#         type_p = _sbx_pair(rng, a.type_p, b.type_p, eta).astype(np.float32),
-#         conn_p = _sbx_pair(rng, a.conn_p, b.conn_p, eta).astype(np.float32),
-#         rot_p  = _sbx_pair(rng, a.rot_p,  b.rot_p,  eta).astype(np.float32),
-#     )
-
-
 
 def _prepare_matrix_from_genome(vec: np.ndarray, shape: tuple[int, int], rng: np.random.Generator) -> np.ndarray:
     m, n = shape
@@ -193,28 +167,23 @@ def nn_controller(model: mj.MjModel, data: mj.MjData, body: Optional[BodyGenome]
 class CPGState:
     def __init__(self, nu: int):
         self.phase = np.zeros(nu, dtype=np.float64)
-        # different natural frequencies to break symmetry
         self.omega = 2*np.pi * (0.4 + 0.2*np.linspace(0,1,nu))
-        # small coupling matrix (nearest-neighbour ring)
         self.K = 0.6
-        self.alpha = 0.05   # amplitude smoothing
+        self.alpha = 0.05
         self.amp = np.ones(nu, dtype=np.float64) * 0.6
 
 def cpg_controller_factory(model: mj.MjModel) -> callable:
     nu = model.nu
     state = CPGState(nu)
-    # choose actuator phases alternating to encourage gait
     for i in range(nu):
         state.phase[i] = (i % 2) * np.pi
     last_time = {"t": 0.0}
 
     def cpg_cb(m: mj.MjModel, d: mj.MjData, body: Optional[BodyGenome] = None):
-        # dt = time per step
         t = d.time
         dt = max(1e-4, t - last_time["t"])
         last_time["t"] = t
 
-        # Kuramoto-like update on phases
         phase = state.phase
         for i in range(nu):
             coupling = 0.0
@@ -224,7 +193,6 @@ def cpg_controller_factory(model: mj.MjModel) -> callable:
             dphi = state.omega[i] + state.K * coupling
             phase[i] = (phase[i] + dphi * dt) % (2*np.pi)
 
-        # slowly adapt amplitudes based on joint limits (if available)
         amp = state.amp
         if m.actuator_ctrlrange is not None and m.actuator_ctrlrange.size == 2*nu:
             lo = m.actuator_ctrlrange[:,0]; hi = m.actuator_ctrlrange[:,1]
@@ -234,7 +202,6 @@ def cpg_controller_factory(model: mj.MjModel) -> callable:
             amp += state.alpha * (target_amp - amp)
 
         u = amp * np.sin(phase)
-        # hard clamp to ctrlrange or ±π/2
         if m.actuator_ctrlrange is not None and m.actuator_ctrlrange.size == 2*nu:
             lo = m.actuator_ctrlrange[:,0]; hi = m.actuator_ctrlrange[:,1]
             d.ctrl[:nu] = np.clip(u, lo, hi)
@@ -246,17 +213,11 @@ def cpg_controller_factory(model: mj.MjModel) -> callable:
 # =========================
 # Simulation helpers
 # =========================
-
 def fitness_function(history: list[float]) -> float:
     xt, yt, zt = TARGET_POSITION
     xc, yc, zc = history[-1]
-
-    # Minimize the distance --> maximize the negative distance
-    cartesian_distance = np.sqrt(
-        (xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2,
-    )
+    cartesian_distance = np.sqrt((xt - xc)**2 + (yt - yc)**2 + (zt - zc)**2)
     return -cartesian_distance
-
 
 def last_x(history: List[List[float]]) -> float:
     return float(history[-1][0])
@@ -275,15 +236,11 @@ def experiment(
     world.spawn(robot.spec, spawn_position=spawn_pos)
     model = world.spec.compile()
     data  = mj.MjData(model)
-    
     mj.mj_resetData(model, data)
 
-        # Pass the model and data to the tracker
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
 
-
-    # choose callback wrapper (Controller wraps the user function)
     mj.set_mjcb_control(lambda m, d: controller.set_control(m, d))
 
     t0 = time.time()
@@ -303,13 +260,12 @@ def experiment(
         viewer.launch(model=model, data=data)
 
     sim_time = time.time() - t0
-    return controller.tracker.history["xpos"][0], sim_time # For now just track all xpos
+    return controller.tracker.history["xpos"][-1], sim_time
 
 # ---------- Non-learner filter ----------
 def quick_motion_screen(body: BodyGenome, spawn: List[float]) -> bool:
     """Short random/CPG rollout to kill non-learners early."""
     mj.set_mjcb_control(None)
-
     try:
         robot, graph = build_robot_from_body(body)
     except Exception:
@@ -322,31 +278,22 @@ def quick_motion_screen(body: BodyGenome, spawn: List[float]) -> bool:
     data = mj.MjData(model)    
 
     if USE_CPG:
-        # CPG screen (very cheap)
-        # build model to make the cpg callback (needs model.nu)
         cpg_cb = cpg_controller_factory(model)
         ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,body=body), tracker=tracker)
     else:
         ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,body), tracker=tracker)
 
     try:
-        # Pass the model and data to the tracker
         if ctrl.tracker is not None:
             ctrl.tracker.setup(world.spec, data)
-
         hist, _ = experiment(robot=robot, controller=ctrl, duration=1.2, mode="simple", spawn_pos=spawn)
         dx = last_x(hist) - spawn[0]
-        # Heuristic thresholds: must move a bit AND have some variance
         return (dx > 0.05) and (np.std(np.diff(np.array(hist)[:,0])) > 1e-4)
     except Exception:
         return False
 
 # ---------- Dynamic duration schedule ----------
 def schedule_duration(best_progress_x: float) -> float:
-    """
-    Increase allowed duration only when checkpoints are reached.
-    Checkpoints roughly: reach x>=0.0 (entering rugged), pass rugged x>=3.0, finish x>=5.0
-    """
     if best_progress_x < 0.0:
         return 15.0
     elif best_progress_x < 3.0:
@@ -356,55 +303,212 @@ def schedule_duration(best_progress_x: float) -> float:
 
 # ---------- Multi-spawn curriculum ----------
 def choose_spawn(gen: int, rng: np.random.Generator) -> List[float]:
-    # Early gens: mostly start; later: mix in mid/late
     if gen < 5:
         return SPAWN_START
     elif gen < 15:
-        return SPAWN_POS_LIST[1]  # start or mid
+        return SPAWN_POS_LIST[1]
     else:
-        return SPAWN_POS_LIST[2]  # any of 3
+        return SPAWN_POS_LIST[2]
 
-# ---------- Rollout & score (with curriculum & dynamic duration) ----------
-def rollout_and_score(body: BodyGenome, duration: float, spawn: List[float]) -> Tuple[float,float]:
-    """Return (fitness, last_x)."""
-    robot, graph = build_robot_from_body(body)
+# =========================
+# GRAPH HELPERS & VARIATION
+# =========================
+def _clone_graph(G: "DiGraph") -> "DiGraph":
+    return json_graph.node_link_graph(json_graph.node_link_data(G))
+
+def _hash_graph(G: "DiGraph") -> str:
+    s = json.dumps(json_graph.node_link_data(G), sort_keys=True)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _repair_graph(G: "DiGraph") -> "DiGraph":
+    """Lightweight repair: ensure root, connectivity; leave attributes to builder."""
+    C = _clone_graph(G)
+    # ensure root id=0 exists
+    if 0 not in C.nodes:
+        # relabel smallest node to 0
+        any_id = min(C.nodes)
+        C = nx.relabel_nodes(C, {any_id: 0}, copy=True)
+    # keep largest weak component containing 0
+    if not nx.is_weakly_connected(C):
+        comps = list(nx.weakly_connected_components(C))
+        comps.sort(key=len, reverse=True)
+        if 0 in comps[0]:
+            C = C.subgraph(comps[0]).copy()
+        else:
+            C = C.subgraph(comps[0]).copy()
+            # ensure a 0 node
+            if 0 not in C.nodes:
+                any_id = min(C.nodes)
+                C = nx.relabel_nodes(C, {any_id: 0}, copy=True)
+    return C
+
+def graph_from_genome(body: BodyGenome) -> "DiGraph":
+    core, graph = build_robot_from_body(body)
+    return _repair_graph(graph)
+
+def graph_crossover_graft(A: "DiGraph", B: "DiGraph") -> "DiGraph":
+    A = _repair_graph(A); B = _repair_graph(B)
+    candidates = [n for n in A.nodes if n != 0]
+    if not candidates:
+        return _clone_graph(B)
+    cut = int(RNG.choice(candidates))
+    sub = set(nx.dfs_tree(A, source=cut).nodes())
+
+    child = _clone_graph(B)
+    next_id = (max(child.nodes) + 1) if child.nodes else 1
+
+    id_map = {}
+    for n in sub:
+        id_map[n] = next_id
+        child.add_node(next_id, **A.nodes[n])
+        next_id += 1
+
+    for u, v, ed in A.edges(data=True):
+        if u in sub and v in sub:
+            child.add_edge(id_map[u], id_map[v], **ed)
+
+    attach = int(RNG.choice(list(child.nodes)))
+    if attach == id_map[cut]:
+        attach = 0 if 0 in child.nodes else attach
+    # minimal edge attrs; your builder may ignore or infer
+    child.add_edge(attach, id_map[cut], **({"orient": 0, "port": 0}))
+    return _repair_graph(child)
+
+
+def mut_rewire_edge(G: "DiGraph") -> "DiGraph":
+    if G.number_of_edges() == 0:
+        return G
+    C = _clone_graph(G)
+    u, v = list(C.edges)[int(RNG.integers(0, C.number_of_edges()))]
+    C.remove_edge(u, v)
+    candidates = [n for n in C.nodes if n != v]
+    if not candidates:
+        return _repair_graph(C)
+    new_parent = int(RNG.choice(candidates))
+    if nx.has_path(C, v, new_parent):  # avoid cycle
+        C.add_edge(u, v)
+        return _repair_graph(C)
+    C.add_edge(new_parent, v, **({"orient": 0, "port": 0}))
+    return _repair_graph(C)
+
+def mut_tweak_node(G: "DiGraph") -> "DiGraph":
+    C = _clone_graph(G)
+    n = int(RNG.choice(list(C.nodes)))
+    nd = C.nodes[n]
+    for key in ("mass", "damping"):
+        if key in nd and isinstance(nd[key], (int, float)):
+            nd[key] = float(np.clip(nd[key] + RNG.normal(0, 0.05), 0.01, 5.0))
+    if "size" in nd and isinstance(nd["size"], (list, tuple)) and len(nd["size"]) == 3:
+        nd["size"] = [float(np.clip(s + RNG.normal(0, 0.005), 0.005, 0.2)) for s in nd["size"]]
+    return _repair_graph(C)
+
+GRAPH_MUTS = [ mut_rewire_edge, mut_tweak_node]
+
+def mutate_graph(G: "DiGraph", ops: int = 2) -> "DiGraph":
+    C = _clone_graph(G)
+    k = max(1, ops)
+    for _ in range(k):
+        C = RNG.choice(GRAPH_MUTS)(C)
+    return _repair_graph(C)
+
+# =========================
+# GRAPH rollout & evaluation
+# =========================
+def rollout_and_score_graph(graph: "DiGraph", duration: float, spawn: List[float]) -> Tuple[float, float]:
+    robot = construct_mjspec_from_graph(graph)
     tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
 
     if USE_CPG:
-        # need a model to size the CPG
         world = OlympicArena()
         world.spawn(robot.spec, spawn_position=spawn)
         model = world.spec.compile()
         data = mj.MjData(model)
         cpg_cb = cpg_controller_factory(model)
-        ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,body=body), tracker=tracker)
+        ctrl = Controller(controller_callback_function=lambda m, d: cpg_cb(m, d, body=None), tracker=tracker)
     else:
-        ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,body), tracker=tracker)
+        ctrl = Controller(controller_callback_function=lambda m, d: nn_controller(m, d, None), tracker=tracker)
 
     hist, _sim_t = experiment(robot=robot, controller=ctrl, duration=duration, mode="simple", spawn_pos=spawn)
     fit = fitness_function(hist)
     px  = last_x(hist)
     return fit, px
 
-# ---------- Tournament selection ----------
-def tournament_select(rng: np.random.Generator, pop: List[BodyGenome], k=TOURNAMENT_K) -> BodyGenome:
-    idxs = rng.choice(len(pop), size=min(k, len(pop)), replace=False)
-    best_idx = max(idxs, key=lambda i: pop[i].fitness)
-    return pop[best_idx]
+def _worker_eval_graph(args):
+    g_json, duration, spawn = args
+    err_buf = io.StringIO()
+    with contextlib.redirect_stderr(err_buf):
+        G = json_graph.node_link_graph(json.loads(g_json))
+        # try:
+        return rollout_and_score_graph(G, duration=duration, spawn=spawn)
+        # except Exception:
+            # return (-1e9, -1e9)
 
-# ---------- Persistence ----------
+def evaluate_population_graph(pop_graphs: List["DiGraph"], duration: float, gen: int) -> List[Tuple[float, float]]:
+    spawn_choices = [choose_spawn(gen, RNG) for _ in pop_graphs]
+    packs = [(json.dumps(json_graph.node_link_data(G)), duration, spawn_choices[i]) for i, G in enumerate(pop_graphs)]
+    with mp.Pool(processes=min(mp.cpu_count(), MAX_PROCESSES)) as pool:
+        return pool.map(_worker_eval_graph, packs)
+
+# =========================
+# Init: GENOTYPES -> GRAPHS (with non-learner screen)
+# =========================
+def init_population_from_genotypes(pop_size: int) -> Tuple[List[GraphBody], List[BodyGenome]]:
+    genomes: List[BodyGenome] = []
+    graphs:  List[GraphBody]  = []
+    attempts = 0
+    while len(graphs) < pop_size and attempts < pop_size * 20:
+        attempts += 1
+        g = sample_body_genome(RNG)
+        if not quick_motion_screen(g, SPAWN_START):
+            continue
+        try:
+            core, graph = build_robot_from_body(g)
+            G = _repair_graph(graph)
+            graphs.append(GraphBody(core=core, graph=G, fitness=-np.inf, progress_x=0.0))
+            genomes.append(g)
+        except Exception:
+            continue
+    if len(graphs) == 0:
+        for _ in range(pop_size):
+            g = sample_body_genome(RNG)
+            core, graph = build_robot_from_body(g)
+            G = _repair_graph(graph)
+            graphs.append(GraphBody(core=core, graph=G, fitness=-np.inf, progress_x=0.0))
+            genomes.append(g)
+    return graphs, genomes
+
+# =========================
+# Tournament selection (graph)
+# =========================
+def tournament_select_graph(pop_graphs: List[GraphBody], k=TOURNAMENT_K) -> GraphBody:
+    idxs = RNG.choice(len(pop_graphs), size=min(k, len(pop_graphs)), replace=False)
+    best_i = int(idxs[0])
+    best_f = pop_graphs[best_i].fitness
+    for j in idxs[1:]:
+        j = int(j)
+        if pop_graphs[j].fitness > best_f:
+            best_i = j; best_f = pop_graphs[j].fitness
+    return pop_graphs[best_i]
+
+# =========================
+# Persistence (graphs)
+# =========================
 STATE_PATH = DATA / "evo_state.pkl"
 CURVES_PATH = DATA / "curves.pkl"
-BEST_JSON_PATH = DATA / "best_body.json"
+BEST_JSON_PATH = DATA / "robot_graph.json"
 BEST_CTRL_PATH = DATA / "best_ctrl.pkl"  # placeholder if you later evolve controllers
 
-def save_state(gen: int, population: List[BodyGenome], best: BodyGenome, gen_curve: List[float], overall_curve: List[float], best_progress: float):
-    # store minimal info to resume
+def save_state(gen: int, population_graphs: List[GraphBody], best_graph: GraphBody,
+               gen_curve: List[float], overall_curve: List[float], best_progress: float):
     state = {
         "gen": gen,
-        "population": [(ind.type_p, ind.conn_p, ind.rot_p, ind.fitness, ind.progress_x) for ind in population],
-        "best": (best.type_p, best.conn_p, best.rot_p, best.fitness, best.progress_x),
-        "best_progress_x": best_progress,
+        "population_graphs": [
+            (json_graph.node_link_data(ind.graph), float(ind.fitness), float(ind.progress_x))
+            for ind in population_graphs
+        ],
+        "best_graph": (json_graph.node_link_data(best_graph.graph),
+                       float(best_graph.fitness), float(best_graph.progress_x)),
+        "best_progress_x": float(best_progress),
     }
     with open(STATE_PATH, "wb") as f:
         pickle.dump(state, f)
@@ -412,22 +516,27 @@ def save_state(gen: int, population: List[BodyGenome], best: BodyGenome, gen_cur
         pickle.dump({"gen_best": gen_curve, "overall_best": overall_curve}, f)
     if SAVE_GRAPH_AND_BEST:
         try:
-            core, graph = build_robot_from_body(best)
-            save_graph_as_json(graph, BEST_JSON_PATH)
+            save_graph_as_json(best_graph.graph, BEST_JSON_PATH)
         except Exception:
             pass
 
-def load_state() -> Tuple[int, List[BodyGenome], BodyGenome, List[float], List[float], float]:
+def load_state() -> Tuple[int, List[GraphBody], GraphBody, List[float], List[float], float]:
     if not STATE_PATH.exists():
         raise FileNotFoundError
     with open(STATE_PATH, "rb") as f:
         s = pickle.load(f)
-    pop = []
-    for (tp, cp, rp, fit, px) in s["population"]:
-        ind = BodyGenome(tp.astype(np.float32), cp.astype(np.float32), rp.astype(np.float32), float(fit), float(px))
-        pop.append(ind)
-    bt = s["best"]
-    best = BodyGenome(bt[0].astype(np.float32), bt[1].astype(np.float32), bt[2].astype(np.float32), float(bt[3]), float(bt[4]))
+
+    pop_graphs: List[GraphBody] = []
+    for g_json, fit, px in s["population_graphs"]:
+        G = json_graph.node_link_graph(g_json)
+        core = construct_mjspec_from_graph(G)
+        pop_graphs.append(GraphBody(core=core, graph=G, fitness=float(fit), progress_x=float(px)))
+
+    best_g_json, best_fit, best_px = s["best_graph"]
+    bestG = json_graph.node_link_graph(best_g_json)
+    best_core = construct_mjspec_from_graph(bestG)
+    best_graph = GraphBody(core=best_core, graph=bestG, fitness=float(best_fit), progress_x=float(best_px))
+
     if CURVES_PATH.exists():
         with open(CURVES_PATH, "rb") as f:
             curves = pickle.load(f)
@@ -436,120 +545,91 @@ def load_state() -> Tuple[int, List[BodyGenome], BodyGenome, List[float], List[f
     else:
         gen_curve, overall_curve = [], []
     best_progress_x = float(s.get("best_progress_x", 0.0))
-    return int(s["gen"]), pop, best, gen_curve, overall_curve, best_progress_x
+    return int(s["gen"]), pop_graphs, best_graph, gen_curve, overall_curve, best_progress_x
 
-# ---------- Evaluation (multiprocessing) ----------
-def _worker_eval(args):
-    ind, duration, spawn = args
-    # try:
-    fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
-    return (fit, px)
-    # except Exception:
-        # return (-1e9, -1e9)
-
-
-def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float,float]]:
-    # choose spawn per evaluation to encourage generalisation
-    spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
-    # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
-    
-    with mp.Pool(processes=min(mp.cpu_count(), MAX_PROCESSES)) as pool:
-        results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
-    return results
-
-# def _worker_eval(args):
-#     ind, duration, spawn = args
-#     fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
-#     return (fit, px)
-
-# def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float, float]]:
-#     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
-#     results = []
-#     for i, ind in enumerate(pop):
-#         results.append(_worker_eval((ind, duration, spawn_choices[i])))
-#     return results
-
-# ---------- Initial population with non-learner filter ----------
-def init_population(rng: np.random.Generator, size: int) -> List[BodyGenome]:
-    pop = []
-    trials = 0
-    while len(pop) < size and trials < size * 20:
-        g = sample_body_genome(rng)
-        spawn = SPAWN_START
-        if quick_motion_screen(g, spawn):
-            pop.append(g)
-        trials += 1
-    # Fallback: if too strict, fill remaining slots without screen
-    while len(pop) < size:
-        pop.append(sample_body_genome(rng))
-    return pop
-
-# ---------- Evolve ----------
-def evolve(total_generations: int = GENERATIONS, run_one_generation: bool = RUN_ONE_GENERATION):
-    rng = np.random.default_rng(SEED)
-
-    # Resume or init
+# =========================
+# EVOLVE: Initialize with genotypes, then Graph EA
+# =========================
+def evolve() -> Tuple[BodyGenome, List[float], List[float]]:
+    """Initialize with NDE genotypes, THEN evolve graphs with a graph EA."""
+    # Resume or fresh
     try:
-        start_gen, population, best_body, gen_best_curve, overall_best_curve, best_progress_x = load_state()
-        console.log(f"[Resume] Loaded generation {start_gen}, best fitness {best_body.fitness:.4f}, best progress x={best_progress_x:.2f}")
-        gen0 = start_gen
-    except FileNotFoundError:
-        population = init_population(rng, POP_SIZE)
-        best_body = population[0]
-        best_body.fitness = -np.inf
-        gen_best_curve = []
-        overall_best_curve = []
-        best_progress_x = 0.0
-        gen0 = 0
+        start_gen, pop_graphs, best_graph, gen_best_curve, overall_best_curve, best_px = load_state()
+        console.log(f"Resuming from gen {start_gen} with {len(pop_graphs)} graphs.")
+        cur_gen = start_gen
+    except Exception:
+        pop_graphs, _genomes = init_population_from_genotypes(POP_SIZE)
+        best_graph = pop_graphs[0]
+        gen_best_curve, overall_best_curve = [], []
+        best_px = 0.0
+        cur_gen = 0
 
-    max_generations_to_run = 1 if run_one_generation else (total_generations - gen0)
-    for gen in range(gen0, min(total_generations, gen0 + max_generations_to_run)):
-        # dynamic duration based on best progress so far
-        duration = schedule_duration(best_progress_x)
-        console.log(f"Generation {gen+1}/{total_generations} — duration={duration:.1f}s")
+    while cur_gen < GENERATIONS:
+        duration = schedule_duration(best_px)
 
-        # Evaluate
-        results = evaluate_population(population, duration=duration, gen=gen)
-        # print(results)
-        with open(DATA / "output.txt", "a") as f:
-            for i, (fit, px) in enumerate(results):
-                f.write(f"Gen {gen+1}, Ind {i}, Fitness: {fit:.4f}, Progress_x: {px:.4f}\n")
-        for ind, (fit, px) in zip(population, results):
-            ind.fitness = fit
-            ind.progress_x = px
+        # Evaluate (graphs)
+        results = evaluate_population_graph([gb.graph for gb in pop_graphs], duration=duration, gen=cur_gen)
+        for i, (fit, px) in enumerate(results):
+            pop_graphs[i].fitness = float(fit)
+            pop_graphs[i].progress_x = float(px)
 
-        population.sort(key=lambda ind: ind.fitness, reverse=True)
-        gen_best = population[0].fitness
+        # Rank & bookkeeping
+        pop_graphs.sort(key=lambda gb: gb.fitness, reverse=True)
+        gen_best = pop_graphs[0].fitness
+        if (best_graph is None) or (gen_best > best_graph.fitness):
+            best_graph = GraphBody(
+                core=construct_mjspec_from_graph(pop_graphs[0].graph),
+                graph=_clone_graph(pop_graphs[0].graph),
+                fitness=pop_graphs[0].fitness,
+                progress_x=pop_graphs[0].progress_x,
+            )
+        best_px = max(best_px, pop_graphs[0].progress_x)
         gen_best_curve.append(gen_best)
+        overall_best_curve.append(best_graph.fitness)
+        console.log(f"[Gen {cur_gen+1:03d}] best={gen_best:.3f} overall={best_graph.fitness:.3f} px={best_px:.2f}")
 
-        if gen_best > best_body.fitness:
-            best_body = population[0]
-            best_progress_x = max(best_progress_x, best_body.progress_x)
+        # Elitism + offspring
+        elites = pop_graphs[:ELITES]
+        fits = [gb.fitness for gb in pop_graphs]
 
-        overall_best_curve.append(best_body.fitness)
-        console.log(f"  Best gen fit: {gen_best:.4f} | Overall best: {best_body.fitness:.4f} | Best x: {best_progress_x:.2f}")
+        def tselect(k=TOURNAMENT_K) -> GraphBody:
+            idxs = RNG.choice(len(pop_graphs), size=min(k, len(pop_graphs)), replace=False)
+            best_i = int(idxs[0]); best_f = fits[best_i]
+            for j in idxs[1:]:
+                j = int(j)
+                if fits[j] > best_f:
+                    best_i = j; best_f = fits[j]
+            return pop_graphs[best_i]
 
-        # Save state each generation
-        save_state(gen+1, population, best_body, gen_best_curve, overall_best_curve, best_progress_x)
+        offspring: List[GraphBody] = []
+        while len(offspring) < POP_SIZE - ELITES:
+            p1 = tselect(); p2 = tselect()
+            child_graph = graph_crossover_graft(p1.graph, p2.graph)
+            child_graph = mutate_graph(child_graph, ops=int(RNG.integers(1, 4)))
+            child_core = construct_mjspec_from_graph(child_graph)
+            offspring.append(GraphBody(core=child_core, graph=child_graph, fitness=-np.inf, progress_x=0.0))
 
-        # Reproduce (elitism + SBX + mutation)
-        new_population: List[BodyGenome] = population[:ELITES]
-        # elites copied (no mutation) — but keep as-is to stabilize
-        while len(new_population) < POP_SIZE:
-            p1 = tournament_select(rng, population)
-            p2 = tournament_select(rng, population)
-            child = crossover_sbx_linked(rng, p1, p2)
-            sigma = float(MUT_BODY_SIGMA * (0.98 ** (gen - gen0)))
-            child = mutate_body_genome(rng, child, sigma=sigma)
-            # soft screen during reproduction (to avoid filling with duds)
-            if quick_motion_screen(child, choose_spawn(gen, rng)):
-                new_population.append(child)
+        pop_graphs = elites + offspring
 
-        population = new_population
+        # Save state and (optionally) stop after one generation
+        save_state(cur_gen+1, pop_graphs, best_graph, gen_best_curve, overall_best_curve, best_px)
+        if RUN_ONE_GENERATION:
+            break
+        cur_gen += 1
 
-    return best_body, gen_best_curve, overall_best_curve
+    # Return a dummy genome for compatibility; graph is saved to disk/state
+    dummy_best = BodyGenome(
+        type_p=np.zeros(GENOTYPE_SIZE, dtype=np.float32),
+        conn_p=np.zeros(GENOTYPE_SIZE, dtype=np.float32),
+        rot_p =np.zeros(GENOTYPE_SIZE, dtype=np.float32),
+        fitness=best_graph.fitness,
+        progress_x=best_graph.progress_x,
+    )
+    return dummy_best, gen_best_curve, overall_best_curve
 
-# ---------- Plotting / viz ----------
+# =========================
+# Plotting / viz
+# =========================
 def show_xpos_history(history: List[List[float]]) -> None:
     camera = mj.MjvCamera()
     camera.type = mj.mjtCamera.mjCAMERA_FREE
@@ -594,8 +674,9 @@ def show_xpos_history(history: List[List[float]]) -> None:
     plt.title("Robot Path in XY Plane")
     plt.show()
 
-# ---------- MuJoCo warning silencer ----------
-# DOESN'T FUCKING WORK FOR SOME GODDAMN REASON
+# =========================
+# MuJoCo warning silencer (stderr filter)
+# =========================
 class _FilterStderr(io.TextIOBase):
     def __init__(self, real_stderr, log_path: Path):
         self._real = real_stderr
@@ -603,13 +684,11 @@ class _FilterStderr(io.TextIOBase):
         self._buf = ""
 
     def write(self, s):
-        # Buffer until newline to filter linewise
         self._buf += s
         out = []
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             if "WARNING: " in line:
-                # divert to file only
                 self._log.write(line + "\n")
             else:
                 out.append(line + "\n")
@@ -642,24 +721,29 @@ def silence_mujoco_warnings():
         except Exception:
             pass
 
-# ---------- Main ----------
+# =========================
+# Main
+# =========================
 def main() -> None:
     with silence_mujoco_warnings():
         best_body, gen_best_curve, overall_best_curve = evolve()
 
-        # Build best body & save artifacts
-        core, graph = build_robot_from_body(best_body)
-        if SAVE_GRAPH_AND_BEST:
-            save_graph_as_json(graph, DATA / "robot_graph.json")
+        # Load the best graph from disk (saved in save_state) and launch a demo
+        if not BEST_JSON_PATH.exists():
+            try:
+                _, _, best_graph, _, _, _ = load_state()
+                save_graph_as_json(best_graph.graph, BEST_JSON_PATH)
+            except Exception:
+                console.log("No saved graph found; skipping demo.")
+                return
 
+        with open(BEST_JSON_PATH, "r", encoding="utf-8") as f:
+            gjson = json.load(f)
+        graph = json_graph.node_link_graph(gjson)
+        core = construct_mjspec_from_graph(graph)
 
-        
-        # Quick demo rollout from full start, using chosen controller
         tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
-
-        
         if USE_CPG:
-            # Need model to size CPG callback
             world = OlympicArena()
             world.spawn(core.spec, spawn_position=SPAWN_START)
             model = world.spec.compile()
@@ -669,20 +753,16 @@ def main() -> None:
         else:
             ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,best_body), tracker=tracker)
 
-        # Pass the model and data to the tracker
-        # if ctrl.tracker is not None:
-        #     ctrl.tracker.setup(world.spec, data)
-            
-        # Choose duration based on current best progress
         try:
             _, _, _, _, _, best_px = load_state()
         except Exception:
             best_px = 0.0
         demo_duration = schedule_duration(best_px)
 
+        # Launch viewer demo
         experiment(robot=core, controller=ctrl, duration=demo_duration, mode="launcher", spawn_pos=SPAWN_START)
 
-        # Plot curves (if you run multiple gens, these will show growth)
+        # Plot curves
         if len(gen_best_curve) and len(overall_best_curve):
             plt.figure()
             plt.plot(gen_best_curve, label="Gen Best")
@@ -695,19 +775,10 @@ def main() -> None:
             plt.savefig(DATA / "fitness_curves.png", dpi=150)
             console.log(f"Saved curves → {DATA / 'fitness_curves.png'}")
 
-        # Optional trajectory viz if just ran a demo
-        # show_xpos_history(tracker.history["xpos"][0])
-
         console.log(f"Best fitness so far: {overall_best_curve[-1]:.4f}" if overall_best_curve else "Run complete.")
         console.log(f"MuJoCo warnings (if any) logged at: {WARN_LOG}")
 
 if __name__ == "__main__":
-    # On windows/mp start method guard
-    # import networkx as nx
-    # RNG = np.random.default_rng(SEED)
-    # body_genome = sample_body_genome(RNG)
-    # plot_graph(build_robot_from_body(body_genome)[1])
-    
     try:
         import multiprocessing as _mp
         if hasattr(_mp, "set_start_method"):
