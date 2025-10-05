@@ -266,10 +266,13 @@ def experiment(
     world.spawn(robot.spec, spawn_position=spawn_pos)
     model = world.spec.compile()
     data  = mj.MjData(model)
+    
     mj.mj_resetData(model, data)
 
+        # Pass the model and data to the tracker
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
+
 
     # choose callback wrapper (Controller wraps the user function)
     mj.set_mjcb_control(lambda m, d: controller.set_control(m, d))
@@ -291,31 +294,37 @@ def experiment(
         viewer.launch(model=model, data=data)
 
     sim_time = time.time() - t0
-    return controller.tracker.history["xpos"][-1], sim_time
+    return controller.tracker.history["xpos"][0], sim_time # For now just track all xpos
 
 # ---------- Non-learner filter ----------
 def quick_motion_screen(body: BodyGenome, spawn: List[float]) -> bool:
     """Short random/CPG rollout to kill non-learners early."""
+    mj.set_mjcb_control(None)
+
     try:
-        robot, _ = build_robot_from_body(body)
+        robot, graph = build_robot_from_body(body)
     except Exception:
         return False
 
+    world = OlympicArena()
+    world.spawn(robot.spec, spawn_position=spawn)
     tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+    model = world.spec.compile()
+    data = mj.MjData(model)    
 
     if USE_CPG:
         # CPG screen (very cheap)
         # build model to make the cpg callback (needs model.nu)
-        world = OlympicArena()
-        world.spawn(robot.spec, spawn_position=spawn)
-        model = world.spec.compile()
-        _ = mj.MjData(model)
         cpg_cb = cpg_controller_factory(model)
         ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,body=body), tracker=tracker)
     else:
         ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,body), tracker=tracker)
 
     try:
+        # Pass the model and data to the tracker
+        if ctrl.tracker is not None:
+            ctrl.tracker.setup(world.spec, data)
+
         hist, _ = experiment(robot=robot, controller=ctrl, duration=1.2, mode="simple", spawn_pos=spawn)
         dx = last_x(hist) - spawn[0]
         # Heuristic thresholds: must move a bit AND have some variance
@@ -349,7 +358,7 @@ def choose_spawn(gen: int, rng: np.random.Generator) -> List[float]:
 # ---------- Rollout & score (with curriculum & dynamic duration) ----------
 def rollout_and_score(body: BodyGenome, duration: float, spawn: List[float]) -> Tuple[float,float]:
     """Return (fitness, last_x)."""
-    robot, _ = build_robot_from_body(body)
+    robot, graph = build_robot_from_body(body)
     tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
 
     if USE_CPG:
@@ -357,7 +366,7 @@ def rollout_and_score(body: BodyGenome, duration: float, spawn: List[float]) -> 
         world = OlympicArena()
         world.spawn(robot.spec, spawn_position=spawn)
         model = world.spec.compile()
-        _ = mj.MjData(model)
+        data = mj.MjData(model)
         cpg_cb = cpg_controller_factory(model)
         ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,body=body), tracker=tracker)
     else:
@@ -421,35 +430,35 @@ def load_state() -> Tuple[int, List[BodyGenome], BodyGenome, List[float], List[f
     return int(s["gen"]), pop, best, gen_curve, overall_curve, best_progress_x
 
 # ---------- Evaluation (multiprocessing) ----------
-# def _worker_eval(args):
-#     ind, duration, spawn = args
-#     # try:
-#     fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
-#     return (fit, px)
-#     # except Exception:
-#         # return (-1e9, -1e9)
-
-
-# def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float,float]]:
-#     # choose spawn per evaluation to encourage generalisation
-#     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
-#     # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
-    
-#     with mp.Pool() as pool:
-#         results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
-#     return results
-
 def _worker_eval(args):
     ind, duration, spawn = args
+    # try:
     fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
     return (fit, px)
+    # except Exception:
+        # return (-1e9, -1e9)
 
-def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float, float]]:
+
+def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float,float]]:
+    # choose spawn per evaluation to encourage generalisation
     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
-    results = []
-    for i, ind in enumerate(pop):
-        results.append(_worker_eval((ind, duration, spawn_choices[i])))
+    # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
+    
+    with mp.Pool() as pool:
+        results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
     return results
+
+# def _worker_eval(args):
+#     ind, duration, spawn = args
+#     fit, px = rollout_and_score(ind, duration=duration, spawn=spawn)
+#     return (fit, px)
+
+# def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> List[Tuple[float, float]]:
+#     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
+#     results = []
+#     for i, ind in enumerate(pop):
+#         results.append(_worker_eval((ind, duration, spawn_choices[i])))
+#     return results
 
 # ---------- Initial population with non-learner filter ----------
 def init_population(rng: np.random.Generator, size: int) -> List[BodyGenome]:
@@ -493,9 +502,9 @@ def evolve(total_generations: int = GENERATIONS, run_one_generation: bool = RUN_
         # Evaluate
         results = evaluate_population(population, duration=duration, gen=gen)
         # print(results)
-        # with open(DATA / "output.txt", "a") as f:
-        #     for i, (fit, px) in enumerate(results):
-        #         f.write(f"Gen {gen+1}, Ind {i}, Fitness: {fit:.4f}, Progress_x: {px:.4f}\n")
+        with open(DATA / "output.txt", "a") as f:
+            for i, (fit, px) in enumerate(results):
+                f.write(f"Gen {gen+1}, Ind {i}, Fitness: {fit:.4f}, Progress_x: {px:.4f}\n")
         for ind, (fit, px) in zip(population, results):
             ind.fitness = fit
             ind.progress_x = px
@@ -634,19 +643,27 @@ def main() -> None:
         if SAVE_GRAPH_AND_BEST:
             save_graph_as_json(graph, DATA / "robot_graph.json")
 
+
+        
         # Quick demo rollout from full start, using chosen controller
         tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+
+        
         if USE_CPG:
             # Need model to size CPG callback
             world = OlympicArena()
             world.spawn(core.spec, spawn_position=SPAWN_START)
             model = world.spec.compile()
-            _ = mj.MjData(model)
+            data = mj.MjData(model)
             cpg_cb = cpg_controller_factory(model)
             ctrl = Controller(controller_callback_function=lambda m,d: cpg_cb(m,d,best_body), tracker=tracker)
         else:
             ctrl = Controller(controller_callback_function=lambda m,d: nn_controller(m,d,best_body), tracker=tracker)
 
+        # Pass the model and data to the tracker
+        # if ctrl.tracker is not None:
+        #     ctrl.tracker.setup(world.spec, data)
+            
         # Choose duration based on current best progress
         try:
             _, _, _, _, _, best_px = load_state()
