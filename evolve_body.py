@@ -70,8 +70,8 @@ TARGET_POSITION = [5.0, 0.0, 0.5]
 # ---------- Evolution hyperparams ----------
 POP_SIZE       = 10
 ELITES         = max(1, POP_SIZE // 10)
-GENERATIONS    = 5                # total desired (if not chunked)
-TOURNAMENT_K   = 8
+GENERATIONS    = 3                # total desired (if not chunked)
+TOURNAMENT_K   = max(2, POP_SIZE // 10)
 MUT_BODY_SIGMA = 0.40
 GENOTYPE_SIZE  = 64
 
@@ -444,7 +444,7 @@ def evaluate_population(pop: List[BodyGenome], duration: float, gen: int) -> Lis
     spawn_choices = [choose_spawn(gen, RNG) for _ in pop]
     # with mj.disable_warnings():  # suppress native warnings where available (failsafe wrapper)
     
-    with mp.Pool() as pool:
+    with mp.Pool(processes=min(mp.cpu_count(), MAX_PROCESSES)) as pool:
         results = pool.map(_worker_eval, [(ind, duration, spawn_choices[i]) for i, ind in enumerate(pop)])
     return results
 
